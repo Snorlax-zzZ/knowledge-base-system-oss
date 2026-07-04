@@ -37,8 +37,9 @@ if [[ "$BUILD_API" -eq 1 ]]; then
   "$ROOT_DIR/scripts/build_mac_kb_api.sh"
 fi
 
-if [[ ! -x "$ROOT_DIR/bin/kb-api" ]]; then
-  echo "missing bin/kb-api. build it first (e.g. with PyInstaller)." >&2
+# 2026-07-01 起 build_mac_kb_api.sh 产 onedir 布局：bin/kb-api/kb-api（目录 + 内部可执行）
+if [[ ! -x "$ROOT_DIR/bin/kb-api/kb-api" ]]; then
+  echo "missing bin/kb-api/kb-api (onedir). run scripts/build_mac_kb_api.sh first." >&2
   exit 1
 fi
 
@@ -55,8 +56,9 @@ fi
 rm -rf "$WORK_DIR"
 mkdir -p "$PAYLOAD_DIR/bin" "$PAYLOAD_DIR/config" "$PAYLOAD_DIR/data" "$PAYLOAD_DIR/logs" "$PAYLOAD_DIR/scripts" "$PAYLOAD_DIR/agent-integration"
 
-cp "$ROOT_DIR/bin/kb-api" "$PAYLOAD_DIR/bin/kb-api"
-chmod +x "$PAYLOAD_DIR/bin/kb-api"
+# onedir 布局：cp 整个 bin/kb-api/ 目录（含可执行 + _internal/ 静态资源）
+cp -R "$ROOT_DIR/bin/kb-api" "$PAYLOAD_DIR/bin/"
+chmod +x "$PAYLOAD_DIR/bin/kb-api/kb-api"
 
 "$ROOT_DIR/scripts/build_menubar_app.sh" \
   --output "$PAYLOAD_DIR/KnowledgeBaseMenuBar.app" \

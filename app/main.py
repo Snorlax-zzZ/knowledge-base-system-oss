@@ -374,15 +374,36 @@ def _repo_singleton_sqlite(sqlite_path: str) -> Any:
         return repo
 
 
-def _invalidate_repo_singletons() -> None:
-    """清空 repo 单例缓存，下次 get_repo 时按最新 DB 配置重建 VectorIndex。
+def _refresh_live_repo_vector_indexes(*, allow_schema_refresh: bool) -> None:
+    """config hot reload 路径：原地热刷新 live VectorIndex，**不 clear repo dict、不 pause、
+    不 close client**——保持进程内 QdrantClient(path=...) 单实例语义。
 
-    用户在 /settings 修改 embedding / rerank / llm 配置后调用，
-    让新配置立刻生效，不再要求重启服务。
+    方案 E：以前 `_invalidate_repo_singletons` 里 clear + pause 会释放旧 vector_index
+    的 portalocker 锁，然后 get_repo 立刻新建 QdrantClient(path=...) 撞 AlreadyLocked。
+    改成原地热刷新 embedding runtime 就绕开这个竞态。
 
-    关键：单纯 dict.clear() 等于 lru_cache.cache_clear()，旧 VectorIndex 仍持有
-    qdrant_local 的 portalocker 文件锁，下次 get_repo 重建时同进程 AlreadyLocked
-    → 新 VectorIndex 静默 enabled=False 退化为关键词检索。这里先 pause 释放锁。
+    - ``allow_schema_refresh=True``：dim 变了会 recreate_collection（config sync 用）
+    - ``allow_schema_refresh=False``：dim 变了也不动 collection（等用户显式 rebuild）
+    """
+    with _repo_singletons_lock:
+        repos = list(_repo_singletons.values())
+    for repo in repos:
+        vi = getattr(repo, "vector_index", None)
+        if vi is None or not hasattr(vi, "reload_from_repo"):
+            continue
+        try:
+            vi.reload_from_repo(repo, allow_schema_refresh=allow_schema_refresh)
+        except Exception:
+            logger.warning("live vector_index reload 失败", exc_info=True)
+
+
+def _drop_repo_singletons_for_tests() -> None:
+    """硬失效：clear repo dict + pause 旧 vector_index。**仅测试 / 极少数硬失效场景用**。
+
+    生产环境 config hot reload 走 `_refresh_live_repo_vector_indexes`——它保证
+    QdrantClient(path=...) 单实例语义，绕开 portalocker 竞态。测试 fixture 用
+    lru_cache 时代留下来的 `cache_clear` 别名走这里，语义与老 `_invalidate_repo_singletons`
+    一致（clear + pause），继续兼容既有测试。
     """
     with _repo_singletons_lock:
         old = list(_repo_singletons.values())
@@ -394,14 +415,14 @@ def _invalidate_repo_singletons() -> None:
         try:
             vi.pause()  # close client + 阻止懒重连；新 repo 会拿到新的 VectorIndex
         except Exception:
-            logger.warning("invalidate: vector_index.pause failed", exc_info=True)
+            logger.warning("drop_repo_singletons: vector_index.pause failed", exc_info=True)
 
 
 # 测试 fixture 历史上用 ``_repo_singleton_sqlite.cache_clear()`` 复位单例（lru_cache 时代）。
-# 切到 dict + Lock 之后保留同名属性指向 invalidate，让既有测试无需 patch；语义一致：都是清池
-# + 释放资源（dict 版本多做 pause 旧 vector_index 释放 qdrant 锁，对测试是更强的保证）。
-_repo_singleton_sqlite.cache_clear = _invalidate_repo_singletons  # type: ignore[attr-defined]
-_repo_singleton_postgres.cache_clear = _invalidate_repo_singletons  # type: ignore[attr-defined]
+# 切到 dict + Lock 之后保留同名属性；语义等同 `_drop_repo_singletons_for_tests`——
+# 清池 + pause 旧 vector_index 释放 qdrant 锁。
+_repo_singleton_sqlite.cache_clear = _drop_repo_singletons_for_tests  # type: ignore[attr-defined]
+_repo_singleton_postgres.cache_clear = _drop_repo_singletons_for_tests  # type: ignore[attr-defined]
 
 
 def _resolve_backend() -> str:
@@ -687,6 +708,61 @@ def ask_knowledge(req: AskRequest, repo: KnowledgeRepo = Depends(get_repo)) -> d
     return KnowledgeService(repo).ask(req)
 
 
+@app.get("/v1/system/vector-index-diagnostic", include_in_schema=False)
+def get_vector_index_diagnostic(repo: KnowledgeRepo = Depends(get_repo)) -> dict[str, Any]:
+    """临时诊断：暴露当前 vector_index 实况，方便定位 rebuild 前的 client None 谜题。
+
+    2026-07-01 方案 E 装机后仍撞 "Qdrant 客户端不可用"，需要看真机 vi 状态。
+    """
+    import os as _os
+    import sys as _sys
+    import importlib.util as _iu
+
+    def _spec_origin(mod_name: str) -> dict[str, Any]:
+        try:
+            spec = _iu.find_spec(mod_name)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"{type(exc).__name__}: {exc}"}
+        if spec is None:
+            return {"found": False}
+        return {"found": True, "origin": spec.origin, "submodule_search_locations": list(spec.submodule_search_locations or [])[:4]}
+
+    vi = getattr(repo, "vector_index", None)
+    deps_diag = {
+        "qdrant_client": _spec_origin("qdrant_client"),
+        "grpc": _spec_origin("grpc"),
+        "pydantic": _spec_origin("pydantic"),
+        "google.protobuf": _spec_origin("google.protobuf"),
+    }
+    if vi is None:
+        return {"vector_index_present": False, "deps": deps_diag, "sys_path_head": _sys.path[:8]}
+    return {
+        "vector_index_present": True,
+        "enabled": bool(getattr(vi, "enabled", None)),
+        "paused": bool(getattr(vi, "_paused", None)),
+        "client_present": getattr(vi, "_client", None) is not None,
+        "schema_refresh_needed": bool(getattr(vi, "_schema_refresh_needed", False)),
+        "last_init_error": getattr(vi, "_last_init_error", None),
+        "qdrant_local_path": getattr(vi, "qdrant_local_path", None),
+        "qdrant_url": getattr(vi, "qdrant_url", None),
+        "collection_name": getattr(vi, "collection_name", None),
+        "embedding_class": type(getattr(vi, "embedding", None)).__name__,
+        "embedding_dim": int(getattr(getattr(vi, "embedding", None), "dim", 0) or 0),
+        "deps": deps_diag,
+        "sys_path_head": _sys.path[:8],
+        "env": {
+            "VECTOR_ENABLED": _os.environ.get("VECTOR_ENABLED"),
+            "QDRANT_MODE": _os.environ.get("QDRANT_MODE"),
+            "QDRANT_LOCAL_PATH": _os.environ.get("QDRANT_LOCAL_PATH"),
+            "QDRANT_URL": _os.environ.get("QDRANT_URL"),
+            "KB_EMBEDDING_ENABLED": _os.environ.get("KB_EMBEDDING_ENABLED"),
+            "KB_EMBEDDING_BASE_URL": _os.environ.get("KB_EMBEDDING_BASE_URL"),
+            "KB_EMBEDDING_MODEL": _os.environ.get("KB_EMBEDDING_MODEL"),
+            "VECTOR_DIM": _os.environ.get("VECTOR_DIM"),
+        },
+    }
+
+
 @app.get("/v1/system/config", response_model=SystemConfigResponse, summary="系统配置读取")
 def get_system_config(repo: KnowledgeRepo = Depends(get_repo)) -> dict[str, Any]:
     return KnowledgeService(repo).get_system_config()
@@ -737,9 +813,15 @@ def put_system_config(req: SystemConfigUpsertRequest, repo: KnowledgeRepo = Depe
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     resp = KnowledgeService(repo).upsert_system_config(req)
-    # 模型配置（embedding / rerank / llm）改动后必须让 repo 单例失效，
-    # 否则 VectorIndex / Reranker 仍持有旧配置创建的客户端，要重启服务才生效。
-    _invalidate_repo_singletons()
+    # 模型配置（embedding / rerank / llm）改动后走 live reload，让新配置立即生效但
+    # **不** clear + pause 老 vector_index（否则 QdrantClient(path=...) portalocker
+    # AlreadyLocked → 方案 E）。
+    # 分流：mode / model_id 变了 → dim / 向量空间会变，但用户还没点 rebuild，此时禁止
+    # 悄悄 recreate_collection（否则会打穿"点 rebuild 前 collection 不被替换"契约）。
+    if mode_changed or model_changed:
+        _refresh_live_repo_vector_indexes(allow_schema_refresh=False)
+    else:
+        _refresh_live_repo_vector_indexes(allow_schema_refresh=True)
 
     # bug 4：mode / model_id 变更后必须联动 desired-state，否则壳层不会停/启 infinity 子进程。
     # 表现：用户从 local 切到 external 后本地 infinity 仍在后台跑、占 1.5GB 内存；
@@ -757,6 +839,8 @@ def put_system_config(req: SystemConfigUpsertRequest, repo: KnowledgeRepo = Depe
                 model_id=req.embedding_service_model_id,
                 device=req.embedding_service_device or "cpu",
                 enabled=True,
+                pytorch_mirror=req.embedding_service_pytorch_mirror,
+                cuda_version=req.embedding_service_cuda_version,
             )
         elif old_mode == "local":
             # 离开 local（→ external / disabled）：让壳层 stop 现役 infinity 释放内存。
@@ -766,6 +850,11 @@ def put_system_config(req: SystemConfigUpsertRequest, repo: KnowledgeRepo = Depe
                 model_id=str(current.get("embedding_service_model_id") or ""),
                 device=str(current.get("embedding_service_device") or "cpu"),
                 enabled=False,
+                pytorch_mirror=str(
+                    current.get("embedding_service_pytorch_mirror")
+                    or "https://download.pytorch.org/whl/"
+                ),
+                cuda_version=str(current.get("embedding_service_cuda_version") or "cu124"),
             )
         # external ↔ disabled：infinity 本来就没跑，不需 bump
     return resp
@@ -800,9 +889,19 @@ def get_embedding_service_status(
     """合并 DB 配置（mode / 默认值）与壳层回写的 actual-state。"""
     cfg = repo.get_system_config()
     actual = get_embedding_service_state().actual()
+    # 2026-07-03 embedding auto-bootstrap 冷启事故 —— installed bit read-side
+    # 兜底：能 running / warming_up 必然 filesystem 装好（infinity 都起来了模型
+    # 和 venv 不可能没在盘），壳层若因 install SSE 秒关流 + reconcile 单 action
+    # 分发时序死结未显式回写 installed，就在 server read 侧 derive 出正确视图，
+    # 避免前端看到 installed=false + running=true 的矛盾态。
+    # 只改 read 侧不动 apply_actual 写侧：壳层原始 installed 信号保留在
+    # ActualState 里，未来 debug 能追溯壳层是否漏写。
+    # 双端 Python 共享，Mac / Win 一次改完；跟 Win 壳层同款兜底并存构成双层
+    # 防御，Mac Swift 壳层无需 mirror。
+    installed_view = actual.installed or actual.running or actual.warming_up
     return {
         "mode": str(cfg.get("embedding_service_mode") or "disabled"),
-        "installed": actual.installed,
+        "installed": installed_view,
         "running": actual.running,
         "warming_up": actual.warming_up,
         # actual 有就用 actual，没回写时退到 DB 配置（前端不会显示空白）
@@ -829,6 +928,8 @@ def get_embedding_service_desired_state(request: Request) -> dict[str, Any]:
         "model_id": d.model_id,
         "device": d.device,
         "enabled": d.enabled,
+        "pytorch_mirror": d.pytorch_mirror,
+        "cuda_version": d.cuda_version,
         "generation": d.generation,
         "updated_at": d.updated_at,
     }
@@ -844,6 +945,9 @@ def get_embedding_service_install_plan(
     model_id: str,
     device: str = "cpu",
     detected_cuda: bool = False,
+    pytorch_mirror: str | None = None,
+    cuda_version: str | None = None,
+    repo: KnowledgeRepo = Depends(get_repo),
 ) -> dict[str, Any]:
     """返回 install_plan JSON，让 Mac Swift / Windows Python 壳层直接据此执行。
 
@@ -851,14 +955,28 @@ def get_embedding_service_install_plan(
     （否则 MODEL_REGISTRY 加一项要改两处，必然漂移）。
 
     壳层调用 → owner_token 校验保护（127.0.0.1 + token，防 web 同源攻击）。
+
+    pytorch_mirror + cuda_version：v1.3.12 加，device=cuda 时影响 pip 命令；
+    缺参时从 system_config 读用户已保存的配置（保持跟 install / switch-model 端点
+    一致；v1.3.12 审计 P1）。
     """
     _require_owner_token(request)
+    cfg = repo.get_system_config()
+    pytorch_mirror = pytorch_mirror or str(
+        cfg.get("embedding_service_pytorch_mirror")
+        or "https://download.pytorch.org/whl/"
+    )
+    cuda_version = cuda_version or str(
+        cfg.get("embedding_service_cuda_version") or "cu124"
+    )
     try:
         plan = build_install_plan(
             model_key=model_id,
             data_root=_resolve_data_root(),
             device=device,
             detected_cuda=detected_cuda,
+            pytorch_mirror=pytorch_mirror,
+            cuda_version=cuda_version,
         )
     except Exception as exc:
         # resolve_model / resolve_device 的业务异常 → 400
@@ -890,6 +1008,7 @@ def get_embedding_service_install_plan(
 def post_embedding_service_actual_state(
     request: Request,
     payload: EmbeddingServiceActualStateRequest,
+    repo: KnowledgeRepo = Depends(get_repo),
 ) -> dict[str, Any]:
     token = request.headers.get(_OWNER_TOKEN_HEADER, "")
     state = get_embedding_service_state()
@@ -911,11 +1030,83 @@ def post_embedding_service_actual_state(
         raise HTTPException(status_code=403, detail="owner token mismatch")
     except GenerationConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+    # 2026-07-01 bug fix：infinity ready 时把 port + dim 同步进 system_config，
+    # 让 kb-api VectorIndex 走真 embedding（不再靠 hash fallback），且下次 kb-api
+    # 冷启也能从 DB 读到正确 port 而不是初值 0。改动幂等：只有当值真变时才 PUT +
+    # 触发 _invalidate_repo_singletons。仅在 running=True 且 port>0 时 sync；
+    # 服务未 ready 时保留用户已保存的 config（避免 flapping 反复覆盖）。
+    if payload.running and payload.port > 0:
+        try:
+            _sync_running_embedding_to_config(repo, payload)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "actual-state → DB config sync 失败 (port=%s model_id=%s)",
+                payload.port, payload.model_id,
+            )
+
     return {
         "accepted": True,
         "acknowledged_generation": actual.acknowledged_generation,
         "updated_at": actual.updated_at,
     }
+
+
+def _sync_running_embedding_to_config(
+    repo: "KnowledgeRepo", payload: "EmbeddingServiceActualStateRequest",
+) -> None:
+    """actual-state ready 时把真实 port + dim 回写 system_config；幂等。
+
+    - port：直接用 payload.port (壳层探到的 /health 端口)
+    - dim：从 DB config 读 model_key → MODEL_REGISTRY 查 dim。actual payload 里
+           model_id 是绝对路径不好用，DB config 里的 model_key 是权威 UI 输入
+    - enabled：设 True 让 VectorIndex.from_env 走 embedding path (mode=local 时
+           local_ready 分支已经不看 enabled，但外部 mode 走这条；统一设 True 无副作用)
+    """
+    cfg = repo.get_system_config() or {}
+    model_key = str(cfg.get("embedding_service_model_id") or "").strip()
+    if not model_key:
+        return  # 用户没配 model_key，不代替他决定
+    spec = MODEL_REGISTRY.get(model_key)
+    if spec is None:
+        return  # 未知模型，不动 dim
+
+    cur_port = int(cfg.get("embedding_service_port") or 0)
+    cur_dim = int(cfg.get("embedding_dim") or 0)
+    cur_enabled = bool(cfg.get("embedding_enabled") or False)
+
+    changes: dict[str, Any] = {}
+    if cur_port != payload.port:
+        changes["embedding_service_port"] = payload.port
+    if cur_dim != spec.dim:
+        changes["embedding_dim"] = spec.dim
+    if not cur_enabled:
+        changes["embedding_enabled"] = True
+
+    if not changes:
+        return
+
+    merged = {**cfg, **changes}
+    # 剥掉 normalize 派生字段（PUT schema 不接受）
+    for k in ("restart_required", "runtime_port_managed_by", "updated_at", "created_at"):
+        merged.pop(k, None)
+    merged.setdefault("api_base_url", "http://127.0.0.1:18000")
+    merged.setdefault("grafana_url", "")
+
+    try:
+        req = SystemConfigUpsertRequest.model_validate(merged)
+    except Exception:  # noqa: BLE001
+        logger.warning("SystemConfigUpsertRequest 校验失败,跳过 sync", exc_info=True)
+        return
+    KnowledgeService(repo).upsert_system_config(req)
+    # 方案 E：走 live reload 保持 QdrantClient(path=...) 单实例，不再 clear +
+    # pause 老 vector_index 触发 portalocker AlreadyLocked。actual-state 心跳同步
+    # 只涉及 port / dim / enabled，dim 变了让 collection schema 跟上（True）。
+    _refresh_live_repo_vector_indexes(allow_schema_refresh=True)
+    logger.info(
+        "embedding actual-state → config sync: %s (model_key=%s)",
+        {k: v for k, v in changes.items()}, model_key,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -942,13 +1133,20 @@ def _resolve_data_root() -> str:
     "/v1/system/embedding-service/install",
     summary="触发 Embedding 服务安装（SSE 转发壳层进度）",
 )
-def post_embedding_service_install(req: EmbeddingServiceInstallRequest):
+def post_embedding_service_install(
+    req: EmbeddingServiceInstallRequest,
+    repo: KnowledgeRepo = Depends(get_repo),
+):
     """写期望状态 action=install + 返回 SSE 流 tail 壳层安装进度。
 
     壳层（mac-app / windows-app ProcessManager）轮询到新 desired 后执行安装
     计划，覆盖式 flush ``runtime/install_status.json``、tee pip 输出到
     ``logs/pip.log``。本端点的 SSE 把这两个文件的变更转发给前端，含 ≤15s
     keepalive（AC21 pip 安装不允许黑盒静默）。
+
+    pytorch_mirror + cuda_version：None 时从 system_config 读，避免脚本直调
+    install 端点时漏传两个参数导致壳层 build_install_plan 用模块默认值
+    （跟用户已在 setup/settings 里配的值不一致）。
     """
     # 校验 model_id 合法（命中 MODEL_REGISTRY）；不合法直接 400
     try:
@@ -956,15 +1154,44 @@ def post_embedding_service_install(req: EmbeddingServiceInstallRequest):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    cfg = repo.get_system_config()
+    pytorch_mirror = req.pytorch_mirror or str(
+        cfg.get("embedding_service_pytorch_mirror")
+        or "https://download.pytorch.org/whl/"
+    )
+    cuda_version = req.cuda_version or str(
+        cfg.get("embedding_service_cuda_version") or "cu124"
+    )
+
+    status_path, pip_log_path = resolve_install_paths(_resolve_data_root())
+
+    # 2026-07-03 P0 fix：新一轮 install 前必须 reset install_status.json，
+    # 否则 SSE streamer initial snapshot 见上一轮遗留的 phase=completed 立即
+    # close stream（install_progress.py:139）→ 壳层 auto-bootstrap POST /install
+    # 秒 return → 抢跑 POST /start → reconcile 只见 desired.action=start → install
+    # handler 从未运行 → 半装 venv/model 场景永远无法 repair，且 UI 见 installed=false。
+    # 删文件比重写非 terminal phase 更简单：SSE `_read_status_snapshot` 见 None
+    # 就等壳层第一次 flush（预期 <1s，installer._prepare 立刻写 phase=preparing）。
+    try:
+        status_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning(
+            "failed to reset %s before install; SSE may close early if stale terminal phase",
+            status_path, exc_info=True,
+        )
+
     state = get_embedding_service_state()
     state.bump_desired(
         action="install",
         model_id=req.model_id,
         device=req.device,
         enabled=True,
+        pytorch_mirror=pytorch_mirror,
+        cuda_version=cuda_version,
     )
 
-    status_path, pip_log_path = resolve_install_paths(_resolve_data_root())
     streamer = InstallSseStreamer(
         status_path=status_path,
         pip_log_path=pip_log_path,
@@ -987,20 +1214,29 @@ def post_embedding_service_install(req: EmbeddingServiceInstallRequest):
 )
 def post_embedding_service_start(
     req: EmbeddingServiceStartStopRequest = Body(default_factory=EmbeddingServiceStartStopRequest),
+    repo: KnowledgeRepo = Depends(get_repo),
 ) -> dict[str, Any]:
     state = get_embedding_service_state()
-    # 默认沿用上一次 desired 的 model_id；显式传 model_id 覆盖
+    # model_id 兜底链：req > prev desired > DB config > "bge-m3"（防 desired + req 空态）
+    # device 兜底链：req > prev desired > DB config > "cpu"（2026-07-02 P1-2 fix：
+    # auto-bootstrap 场景 prev.device 是空的走 "cpu" 会吞掉 DB 里的 mps/cuda 配置）
     prev = state.desired()
-    model_id = req.model_id or prev.model_id
+    cfg = repo.get_system_config()
+    model_id = req.model_id or prev.model_id or str(cfg.get("embedding_service_model_id") or "bge-m3")
+    device = req.device or prev.device or str(cfg.get("embedding_service_device") or "cpu")
     d = state.bump_desired(
         action="start",
         model_id=model_id,
-        device=prev.device or "cpu",
+        device=device,
         enabled=True,
+        pytorch_mirror=prev.pytorch_mirror,
+        cuda_version=prev.cuda_version,
     )
     return {
         "action": d.action, "model_id": d.model_id, "device": d.device,
-        "enabled": d.enabled, "generation": d.generation, "updated_at": d.updated_at,
+        "enabled": d.enabled,
+        "pytorch_mirror": d.pytorch_mirror, "cuda_version": d.cuda_version,
+        "generation": d.generation, "updated_at": d.updated_at,
     }
 
 
@@ -1017,10 +1253,14 @@ def post_embedding_service_stop() -> dict[str, Any]:
         model_id=prev.model_id,
         device=prev.device or "cpu",
         enabled=False,
+        pytorch_mirror=prev.pytorch_mirror,
+        cuda_version=prev.cuda_version,
     )
     return {
         "action": d.action, "model_id": d.model_id, "device": d.device,
-        "enabled": d.enabled, "generation": d.generation, "updated_at": d.updated_at,
+        "enabled": d.enabled,
+        "pytorch_mirror": d.pytorch_mirror, "cuda_version": d.cuda_version,
+        "generation": d.generation, "updated_at": d.updated_at,
     }
 
 
@@ -1032,6 +1272,7 @@ def post_embedding_service_stop() -> dict[str, Any]:
 )
 def post_embedding_service_switch_model(
     req: EmbeddingServiceSwitchModelRequest,
+    repo: KnowledgeRepo = Depends(get_repo),
 ) -> dict[str, Any]:
     """切换内置 Embedding 模型（design v1.2 §4.5 / AC22）。
 
@@ -1062,12 +1303,23 @@ def post_embedding_service_switch_model(
             detail="向量索引重建进行中，请等 rebuild 完成或先 abort 再切模型",
         )
 
+    cfg = repo.get_system_config()
+    pytorch_mirror = req.pytorch_mirror or str(
+        cfg.get("embedding_service_pytorch_mirror")
+        or "https://download.pytorch.org/whl/"
+    )
+    cuda_version = req.cuda_version or str(
+        cfg.get("embedding_service_cuda_version") or "cu124"
+    )
+
     state = get_embedding_service_state()
     d = state.bump_desired(
         action="switch_model",
         model_id=req.model_id,
         device=req.device,
         enabled=True,
+        pytorch_mirror=pytorch_mirror,
+        cuda_version=cuda_version,
     )
     return {
         "action": d.action,
@@ -1621,11 +1873,17 @@ def restart_local_service() -> dict[str, Any]:
     if backend != "sqlite":
         raise HTTPException(status_code=400, detail=f"不支持的 KB_BACKEND: {backend}")
 
-    root_dir = APP_DIR.parent
+    # PyInstaller --onefile 坑:__file__.parent 在 frozen mode 下是 _MEIPASS 解压
+    # 临时目录,_MEIPASS\scripts 里没有 local-restart-direct.ps1(build 没 add-data
+    # 进去),会拿到 404 "restart script not found"。实际脚本在 installer 装到的
+    # install root 下 ({install_root}\scripts\local-restart-direct.ps1),走
+    # KB_APP_ROOT 环境变量(tray_app_local 启动 kb-api 时已注入)。dev 模式没注入
+    # 时退到 APP_DIR.parent(此时 __file__ 在源码 app/ 下,APP_DIR.parent = 仓库根)。
+    root_dir = FilePath(_resolve_data_root())
 
     try:
         if sys.platform.startswith("win"):
-            # 直装版优先（scripts/local-restart-direct.ps1：taskkill kb-api.exe + 重启 bin\kb-api.exe）
+            # 直装版优先（scripts/local-restart-direct.ps1：taskkill kb-api + 启动 bin\kb-api\kb-api.exe（onedir）或 bin\kb-api.exe（onefile 兼容））
             # 开发模式 fallback（scripts/local-restart.ps1：local-stop.ps1 + local-start.ps1，依赖 .venv）
             scripts_dir = root_dir / "scripts"
             restart_script = scripts_dir / "local-restart-direct.ps1"

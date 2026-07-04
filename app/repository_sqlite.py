@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -52,6 +53,18 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
             raise
         finally:
             conn.close()
+
+    def reset_schema(self) -> None:
+        """公开重建 schema 入口。
+
+        场景：X2.5 legacy lane 的 clear / import-package 走文件级 rm knowledge.db +
+        cp 新文件后，本单例 repo 内部无 fd 缓存但 sqlite3.connect(path) 遇到不存在的
+        文件会创建空 db（无表） → 后续所有请求撞 ``no such table: system_config`` 500。
+        clear / import 完成后必须调 reset_schema() 让 CREATE TABLE IF NOT EXISTS 兜底
+        建表。__post_init__ 已经在启动时跑过一次，reset_schema 是运行时"数据文件被外部
+        动过"的自愈入口，跟 on_qdrant_reinit 对称。
+        """
+        self._ensure_tables()
 
     def _ensure_tables(self) -> None:
         with self._connect() as conn:
@@ -137,6 +150,8 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                     embedding_service_model_id TEXT NOT NULL DEFAULT '',
                     embedding_service_port INTEGER NOT NULL DEFAULT 0,
                     embedding_service_device TEXT NOT NULL DEFAULT 'cpu',
+                    embedding_service_pytorch_mirror TEXT NOT NULL DEFAULT 'https://download.pytorch.org/whl/',
+                    embedding_service_cuda_version TEXT NOT NULL DEFAULT 'cu124',
                     updated_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_ki_domain_project_status
@@ -205,6 +220,17 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                 conn.execute("ALTER TABLE system_config ADD COLUMN embedding_service_port INTEGER NOT NULL DEFAULT 0")
             with contextlib.suppress(Exception):
                 conn.execute("ALTER TABLE system_config ADD COLUMN embedding_service_device TEXT NOT NULL DEFAULT 'cpu'")
+            # v1.3.12 cuda wheel 安装配置（device=cuda 时生效）
+            with contextlib.suppress(Exception):
+                conn.execute(
+                    "ALTER TABLE system_config ADD COLUMN embedding_service_pytorch_mirror"
+                    " TEXT NOT NULL DEFAULT 'https://download.pytorch.org/whl/'"
+                )
+            with contextlib.suppress(Exception):
+                conn.execute(
+                    "ALTER TABLE system_config ADD COLUMN embedding_service_cuda_version"
+                    " TEXT NOT NULL DEFAULT 'cu124'"
+                )
 
     @staticmethod
     def _dt_str(dt: datetime | None) -> str | None:
@@ -952,7 +978,8 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                 " rerank_enabled, rerank_api_key, rerank_base_url, rerank_model, rerank_path, rerank_timeout_sec,"
                 " enrichment_enabled,"
                 " embedding_service_mode, embedding_service_managed, embedding_service_model_id,"
-                " embedding_service_port, embedding_service_device, updated_at"
+                " embedding_service_port, embedding_service_device,"
+                " embedding_service_pytorch_mirror, embedding_service_cuda_version, updated_at"
                 " FROM system_config WHERE id = 1"
             ).fetchone()
             if row:
@@ -991,6 +1018,8 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                 "embedding_service_model_id": "",
                 "embedding_service_port": 0,
                 "embedding_service_device": "cpu",
+                "embedding_service_pytorch_mirror": "https://download.pytorch.org/whl/",
+                "embedding_service_cuda_version": "cu124",
                 "updated_at": None,
             }
 
@@ -1031,6 +1060,25 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
         embedding_service_device = str(payload.get("embedding_service_device") or "cpu").strip().lower()
         if embedding_service_device not in {"cpu", "cuda", "mps"}:
             embedding_service_device = "cpu"
+        # CUDA wheel 安装配置（v1.3.12）：仅 device=cuda 时影响 pip 命令。
+        # 非法值回落默认，避免脏 URL / 版本号流入 inline pip script。
+        # 只允许 https:// —— pip 装 wheel 时 http 易被 MITM 替换为恶意 wheel
+        # （供应链入口，v1.3.12 审计 P2）；如确需内网 http mirror，用户在自己
+        # 改源码 + 接受风险，不开公开默认 path。
+        embedding_service_pytorch_mirror = str(
+            payload.get("embedding_service_pytorch_mirror")
+            or "https://download.pytorch.org/whl/"
+        ).strip()
+        if not (
+            embedding_service_pytorch_mirror.startswith("https://")
+            and embedding_service_pytorch_mirror.endswith("/")
+        ):
+            embedding_service_pytorch_mirror = "https://download.pytorch.org/whl/"
+        embedding_service_cuda_version = str(
+            payload.get("embedding_service_cuda_version") or "cu124"
+        ).strip().lower()
+        if not re.fullmatch(r"cu\d{2,4}", embedding_service_cuda_version):
+            embedding_service_cuda_version = "cu124"
         if ui_theme not in {"linear", "glass", "neo"}:
             ui_theme = "neo"
         if not api_base_url or not grafana_url:
@@ -1047,9 +1095,10 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                   rerank_enabled, rerank_api_key, rerank_base_url, rerank_model, rerank_path, rerank_timeout_sec,
                   enrichment_enabled,
                   embedding_service_mode, embedding_service_managed, embedding_service_model_id,
-                  embedding_service_port, embedding_service_device, updated_at
+                  embedding_service_port, embedding_service_device,
+                  embedding_service_pytorch_mirror, embedding_service_cuda_version, updated_at
                 )
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                   api_base_url=excluded.api_base_url,
                   service_port=excluded.service_port,
@@ -1080,6 +1129,8 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                   embedding_service_model_id=excluded.embedding_service_model_id,
                   embedding_service_port=excluded.embedding_service_port,
                   embedding_service_device=excluded.embedding_service_device,
+                  embedding_service_pytorch_mirror=excluded.embedding_service_pytorch_mirror,
+                  embedding_service_cuda_version=excluded.embedding_service_cuda_version,
                   updated_at=excluded.updated_at
                 """,
                 (
@@ -1091,6 +1142,7 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                     1 if enrichment_enabled else 0,
                     embedding_service_mode, 1 if embedding_service_managed else 0, embedding_service_model_id,
                     embedding_service_port, embedding_service_device,
+                    embedding_service_pytorch_mirror, embedding_service_cuda_version,
                     now_str,
                 ),
             )

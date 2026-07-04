@@ -24,8 +24,8 @@
 
 1. 接入文档：`.md` / `.markdown` / `.txt` / `.docx` / `.pdf`（PDF 可选 OCR 兜底）；以及通过 `upsert_knowledge` 写入的任意 Markdown 片段。
 2. 双部署模式存储：
-   - 直装版（主路线）：SQLite 主存 + Qdrant local（嵌入模式）
-   - Docker 版（规划中，v1.x 计划）：PostgreSQL 主存 + Qdrant server
+   - 直装版：SQLite 主存 + Qdrant local（嵌入模式）
+   - Docker 版：PostgreSQL 主存 + Qdrant server
 3. 同一套 API / MCP / 检索逻辑跨两种模式保持一致。
 4. 统一 HTTP API 与 MCP 工具，先做 ACL 过滤再做混合（关键词 + 向量）召回与重排。
 5. 可写回新知识条目，自动版本化。

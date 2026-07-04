@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# NOTE (2026-07-02 X2.5 refactor):
+# 此脚本作为 CLI + Mac MenuBar 便利工具保留(含 osascript 弹选择框逻辑)。
+# API endpoint /v1/knowledge/import-package 契约已迁移到
+# app/services/knowledge_package.py:KnowledgePackageService.import_package
+# (只 mirror 本脚本的 tar.gz 分支; 非 tar.gz 单文件上传走 /v1/knowledge/import-file)。
+# Python 版和本脚本产的 tarball 双向互操作 (legacy lane 严格等语义)。
+# 详见 docs/_review_inputs/2026-07-02-tarball-format-audit.md。
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"

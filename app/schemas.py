@@ -203,6 +203,9 @@ class SystemConfigResponse(BaseModel):
     embedding_service_model_id: str = Field(default="")
     embedding_service_port: int = Field(default=0, ge=0, le=65535)
     embedding_service_device: str = Field(default="cpu")
+    # CUDA wheel 安装配置（v1.3.12，device=cuda 时生效；cpu/mps 忽略）
+    embedding_service_pytorch_mirror: str = Field(default="https://download.pytorch.org/whl/")
+    embedding_service_cuda_version: str = Field(default="cu124")
     rerank_enabled: bool = Field(default=False)
     rerank_api_key: str = Field(default="")
     rerank_base_url: str = Field(default="")
@@ -239,6 +242,20 @@ class SystemConfigUpsertRequest(BaseModel):
     embedding_service_model_id: str = Field(default="")
     embedding_service_port: int = Field(default=0, ge=0, le=65535)
     embedding_service_device: str = Field(default="cpu", pattern="^(cpu|cuda|mps)$")
+    # CUDA wheel 安装配置（v1.3.12）：device=cuda 时 pip 走 --index-url {mirror}{cuda_version}
+    # 拉 cuda wheel。默认 PyTorch 官方 PEP 503 索引 + cu124（cp313+win_amd64 唯一覆盖）；
+    # 国内用户慢请配代理，或在 setup 改 mirror 指向自建 PEP 503 兼容源。
+    # 老驱动 (<530) 用户改 cu118；新驱动 (>=570) 用户改 cu128。
+    embedding_service_pytorch_mirror: str = Field(
+        default="https://download.pytorch.org/whl/",
+        min_length=1,
+        max_length=256,
+        pattern=r"^https://[^\s]+/$",
+    )
+    embedding_service_cuda_version: str = Field(
+        default="cu124",
+        pattern=r"^cu\d{2,4}$",
+    )
     # 改 mode / model_id 会触发 reindex，请求方需带 I-CONFIRM-REINDEX 才能放行
     confirm_reindex: str | None = Field(default=None, max_length=64)
     rerank_enabled: bool = Field(default=False)
@@ -278,6 +295,9 @@ class EmbeddingServiceDesiredStateResponse(BaseModel):
     model_id: str = Field(default="")
     device: str = Field(default="cpu")
     enabled: bool = Field(default=False)
+    # v1.3.12：cuda wheel 安装配置（device=cuda 时壳层据此拉 cuda wheel）
+    pytorch_mirror: str = Field(default="https://download.pytorch.org/whl/")
+    cuda_version: str = Field(default="cu124")
     generation: int = Field(default=0, ge=0)
     updated_at: float = Field(default=0.0)
 
@@ -334,15 +354,30 @@ class EmbeddingServiceInstallRequest(BaseModel):
     """POST /v1/system/embedding-service/install 请求体。
 
     model_id 必填（如 ``bge-m3``）；device / mirror 可选，默认 cpu / hf-mirror。
+    device=cuda 时 pytorch_mirror + cuda_version 决定 torch wheel 来源；cpu/mps 忽略。
     """
     model_id: str = Field(min_length=1, max_length=128)
     device: str = Field(default="cpu", pattern="^(cpu|cuda|mps)$")
     mirror: str | None = Field(default=None, max_length=256)
+    pytorch_mirror: str | None = Field(
+        default=None, max_length=256, pattern=r"^https://[^\s]+/$"
+    )
+    cuda_version: str | None = Field(default=None, pattern=r"^cu\d{2,4}$")
 
 
 class EmbeddingServiceStartStopRequest(BaseModel):
-    """POST /v1/system/embedding-service/start | stop 请求体（可空）。"""
+    """POST /v1/system/embedding-service/start | stop 请求体（可空）。
+
+    device 传空/None 表示沿用 prev desired（或 desired 空态 fallback DB config）；
+    显式传 'cpu'/'mps'/'cuda' 覆盖。auto-bootstrap 场景（Mac Swift、Win Python
+    壳层重启后 desired 归零）必须显式传 device，避免走 "cpu" 兜底吞掉 DB 里的
+    mps/cuda 配置。
+    """
     model_id: str = Field(default="", max_length=128)
+    # 2026-07-02 P1 fix: 加 pattern 校验防脏值流入 desired.device;空串表示"沿用
+    # prev / DB config",kb-api 端 3 级兜底。跨端一致(Win 传 cpu/cuda,Mac 传
+    # cpu/mps/cuda 都命中此正则)。
+    device: str = Field(default="", pattern="^(|cpu|cuda|mps)$")
 
 
 class EmbeddingServiceInstallPlanResponse(BaseModel):
@@ -376,6 +411,10 @@ class EmbeddingServiceSwitchModelRequest(BaseModel):
     model_id: str = Field(min_length=1, max_length=128)
     device: str = Field(default="cpu", pattern="^(cpu|cuda|mps)$")
     confirm: str = Field(min_length=1)
+    pytorch_mirror: str | None = Field(
+        default=None, max_length=256, pattern=r"^https://[^\s]+/$"
+    )
+    cuda_version: str | None = Field(default=None, pattern=r"^cu\d{2,4}$")
 
 
 class EmbeddingServiceSwitchModelResponse(BaseModel):

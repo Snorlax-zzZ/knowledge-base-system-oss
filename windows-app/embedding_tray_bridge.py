@@ -72,6 +72,11 @@ def _install_plan_to_spec(plan, model_id: str) -> InstallSpec:
     （那是 HF repo id）。``is_owned_infinity`` 的 model_id 匹配规则按 plan 内
     --model-id 字段是 ``model_dir`` 路径，cmdline 含 ``--model-id {model_dir}``
     —— 当残留识别用，model_id 字段同时充当 path 比对。
+
+    **Win 平台路径翻译**：``build_install_plan`` 按 design.md §3.3 给的是逻辑
+    入口名 ``venv/bin/python``（Mac/Linux 风格），Win venv 实际在
+    ``venv\\Scripts\\python.exe``。Win 壳层这里翻译 ``pip_install_cmd[0]`` +
+    ``create_venv_cmd``。``start_cmd`` 翻译另走 ``_translate_start_cmd_to_win``。
     """
     return InstallSpec(
         model_id=plan.model_dir,  # 与 start_cmd 内 --model-id 保持一致，便于残留判定
@@ -79,15 +84,64 @@ def _install_plan_to_spec(plan, model_id: str) -> InstallSpec:
         model_dir=plan.model_dir,
         device=plan.device,
         create_venv_cmd=list(plan.create_venv_cmd),
-        pip_install_cmd=list(plan.pip_install_cmd),
+        pip_install_cmd=_translate_venv_python_cmd_to_win(
+            list(plan.pip_install_cmd), plan.venv_dir,
+        ),
         download_args=dict(plan.download_args),
     )
 
 
+def _translate_venv_python_cmd_to_win(cmd: list[str], venv_dir: str) -> list[str]:
+    """把命令里 ``venv/bin/python`` 替换成 Win 的 ``venv\\Scripts\\python.exe``。
+
+    ``build_install_plan`` 的 ``pip_install_cmd`` 是 ``[venv_python, "-c",
+    "<script>"]`` 形式，Win 上 ``venv_python`` 是 Mac/Linux 风格路径
+    ``D:\\KnowledgeBase\\embedding-service\\venv\\bin\\python``，文件不存在
+    → ``subprocess.Popen`` 抛 ``[WinError 2]``。这里只动 ``cmd[0]``，其余参数
+    不动（``-c`` 后的 script 里用 ``sys.executable`` 取当前进程 Python，自动
+    指向 venv Python，不需要硬替换）。
+    """
+    if not cmd:
+        return cmd
+    out = list(cmd)
+    first = out[0]
+    if first.endswith("python") or first.endswith("python.exe"):
+        out[0] = str(Path(venv_dir) / "Scripts" / "python.exe")
+    return out
+
+
 def _start_cmd_with_port(plan_start_cmd: list[str], port: int) -> list[str]:
-    """build_install_plan 给的 start_cmd 不含 ``--port``；壳层选完空闲端口后追加。"""
+    """build_install_plan 给的 start_cmd 不含 ``--port``；壳层选完空闲端口后追加。
+
+    注意：``plan_start_cmd`` 的 ``--port`` 实际上在 ``build_install_plan`` 已经
+    硬编码了 ``DEFAULT_EMBEDDING_PORT``（见 embedding_install.py:258）。这里再
+    追加一次是 contract 设计冗余——双 ``--port`` 时 infinity 取最后一个，所以
+    实际端口仍是壳层选的 ``port``。保留追加以兜底未来 plan 不再硬编码的情况。
+    """
     cmd = list(plan_start_cmd)
     cmd.extend(["--port", str(port)])
+    return cmd
+
+
+def _translate_start_cmd_to_win(plan_start_cmd: list[str], venv_dir: str) -> list[str]:
+    """Win 平台 start_cmd 路径翻译：plan.start_cmd[0] 是 ``venv/bin/infinity_emb``
+    (Mac/Linux)，Windows venv 实际是 ``venv\\Scripts\\infinity_emb.exe``。
+
+    不翻译的话 ``subprocess.Popen`` 找不到可执行文件 → ``[WinError 2] 系统找
+    不到指定的文件``，infinity 永远起不来，``runtime/pid`` + ``runtime/port``
+    都不写入，前端看到 ``running=false`` + ``spawn failed``。
+
+    与 ``_install_plan_to_spec`` 里的 pip_install_cmd 翻译同源（sh-c → Win
+    native），都是因为 ``app/services/embedding_install.py`` 按 design.md §3.3
+    保持"零平台分支"，Windows 路径硬编码 ``venv/bin/...`` 需要在壳层翻译。
+    """
+    if not plan_start_cmd:
+        return plan_start_cmd
+    cmd = list(plan_start_cmd)
+    first = cmd[0]
+    # 兼容 "venv/bin/infinity_emb" 或绝对路径 ".../venv/bin/infinity_emb"
+    if first.endswith("infinity_emb") and "Scripts" not in first:
+        cmd[0] = str(Path(venv_dir) / "Scripts" / "infinity_emb.exe")
     return cmd
 
 
@@ -212,6 +266,8 @@ def make_default_spec_factory(data_root: Path) -> Callable[
         try:
             plan = build_install_plan(
                 desired.model_id, str(data_root), device=desired.device,
+                pytorch_mirror=desired.pytorch_mirror,
+                cuda_version=desired.cuda_version,
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("build_install_plan failed for %s: %s", desired.model_id, e)
@@ -230,10 +286,16 @@ def make_default_spec_factory(data_root: Path) -> Callable[
         start_spec = StartSpec(
             model_id=plan.model_dir,  # 与 cmdline --model-id 字段一致
             device=plan.device,
-            start_cmd=_start_cmd_with_port(plan.start_cmd, port),
+            start_cmd=_start_cmd_with_port(
+                _translate_start_cmd_to_win(plan.start_cmd, plan.venv_dir),
+                port,
+            ),
             port=port,
             runtime_dir=runtime_dir,
             infinity_log_path=infinity_log,
+            # 透传 plan.env（INFINITY_BETTERTRANSFORMER=false 等），缺这一步
+            # infinity 启动撞 NameError(BetterTransformerManager) → exit 3
+            env=dict(plan.env or {}),
         )
 
         return EmbeddingActionContext(

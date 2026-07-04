@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# NOTE (2026-07-02 X2.5 refactor):
+# 此脚本作为 CLI + Mac MenuBar (via kb-import-package.sh) 便利工具保留。
+# 对应 in-process Python 实现:
+# app/services/knowledge_package.py:KnowledgePackageService._restore_from_backup。
+# 支持的备份布局 (sqlite / postgres) 跟本脚本严格一致, 双向互操作。
+# 详见 docs/_review_inputs/2026-07-02-tarball-format-audit.md。
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then

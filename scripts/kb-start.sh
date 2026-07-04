@@ -82,8 +82,18 @@ cleanup_stale
 
 mkdir -p "$ROOT_DIR/data" "$ROOT_DIR/logs"
 
-if [[ -x "$ROOT_DIR/bin/kb-api" ]]; then
-  nohup "$ROOT_DIR/bin/kb-api" >"$LOG_OUT" 2>"$LOG_ERR" &
+# 2026-07-01 onedir 布局：bin/kb-api/kb-api（新）；兼容旧 onefile 布局：bin/kb-api（老 dmg build）
+# 注意：`-x <dir>` 对目录返回 true（+x = 可进入），必须先判目录再挑真二进制，
+# 否则 nohup 一个目录会得到 "Permission denied"。
+KB_API_BIN=""
+if [[ -x "$ROOT_DIR/bin/kb-api/kb-api" ]]; then
+  KB_API_BIN="$ROOT_DIR/bin/kb-api/kb-api"
+elif [[ -x "$ROOT_DIR/bin/kb-api" ]] && [[ ! -d "$ROOT_DIR/bin/kb-api" ]]; then
+  KB_API_BIN="$ROOT_DIR/bin/kb-api"
+fi
+
+if [[ -n "$KB_API_BIN" ]]; then
+  nohup "$KB_API_BIN" >"$LOG_OUT" 2>"$LOG_ERR" &
   pid=$!
   echo "$pid" > "$PID_FILE"
 

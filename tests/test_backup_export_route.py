@@ -40,7 +40,7 @@ def test_export_endpoint_returns_gzip_stream(client):
         "project": "p",
         "type": "fact",
         "content_markdown": "c",
-        "author": "wzt",
+        "author": "test-user",
         "change_note": "init",
     })
     assert r.status_code == 200

@@ -14,6 +14,7 @@ venv 里），所以设备检测（torch.cuda.is_available）只能由壳层在 
 """
 from __future__ import annotations
 
+import re
 import socket
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -151,11 +152,15 @@ def find_free_port(start_port: int = DEFAULT_EMBEDDING_PORT, host: str = "127.0.
 
     注意 TOCTOU：本函数只保证调用瞬间空闲，壳层真正启动 infinity 前应再次确认；
     最终监听端口以壳层写入 runtime/port 的实际值为准。
+
+    历史踩坑：v1.3.12 之前带 ``SO_REUSEADDR=1``——Mac/Linux 上仅允许 TIME_WAIT
+    端口复用，行为正常；但 Windows 上 ``SO_REUSEADDR`` 允许两个 LISTENING 共占
+    同端口，导致 bind 永远成功 → 撞已占用端口时假阳性返回，调用方实际起 infinity
+    时撞 EADDRINUSE 崩。去掉 setsockopt，跨平台行为统一。
     """
     for offset in range(max_tries):
         port = start_port + offset
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sock.bind((host, port))
                 return port
@@ -190,6 +195,113 @@ def should_block_writes_for_reindex(pending_chunk_count: int) -> bool:
     return pending_chunk_count >= REINDEX_MAINTENANCE_THRESHOLD
 
 
+DEFAULT_PYTORCH_MIRROR = "https://download.pytorch.org/whl/"
+DEFAULT_CUDA_VERSION = "cu124"
+
+
+def _normalize_pytorch_mirror(mirror: str | None) -> str:
+    """空值/格式异常回落默认（强制 https + 尾斜杠）；避免脏 URL 流入 pip。
+
+    只允许 https:// —— 走 http 装 wheel 易被 MITM 替换为恶意 wheel（v1.3.12
+    审计 P2 供应链入口）。如用户内网 mirror 只有 http，需改源码 + 接受风险。
+    """
+    m = (mirror or "").strip()
+    if not m or not m.startswith("https://") or not m.endswith("/"):
+        return DEFAULT_PYTORCH_MIRROR
+    return m
+
+
+def _normalize_cuda_version(version: str | None) -> str:
+    """非 cu\\d+ 格式回落 cu121；统一小写。
+
+    pattern `cu\\d{2,4}` 兼容历史 (cu90/cu100/cu118) + 当前 (cu121/cu124/cu128)
+    + 未来可能的 4 位标签（如 cu1310）。
+    """
+    v = (version or "").strip().lower()
+    if not re.fullmatch(r"cu\d{2,4}", v):
+        return DEFAULT_CUDA_VERSION
+    return v
+
+
+def _build_pip_inline_script(
+    resolved_device: str, pytorch_mirror: str, cuda_version: str,
+) -> str:
+    """生成 pip_install_cmd 的 -c inline script。
+
+    device == "cuda":
+      Step 1   装 infinity-emb 全套（拉 CPU torch wheel + 全依赖）
+      Step 1.5 force-reinstall torch torchvision，从 {pytorch_mirror}{cuda_version}/
+               拉 CUDA wheel 覆盖 Step 1 装的 CPU wheel
+      Step 2   force-upgrade numpy>=2.1 + click<8.2 (Python 3.13 + Win 必需 pin)
+
+    device == "cpu" / "mps":
+      跳过 Step 1.5；Step 1 装的 CPU wheel 直接用（mac 上自带 mps backend，
+      linux/win cpu 用户原生 CPU wheel 就够）。
+
+    URL 安全：pytorch_mirror + cuda_version 在调用前已 normalize 过，这里 repr()
+    保证 inline script 内字符串字面量正确（不会有引号 / 反斜杠注入风险）。
+    """
+    cuda_step = ""
+    if resolved_device == "cuda":
+        # 用 ``--index-url`` 替换默认 PyPI 索引（PyTorch 官方布局是标准 PEP 503
+        # simple index，``{mirror}{cuda_version}`` 即可让 pip 自动拼 ``/torch/``
+        # ``/torchvision/`` 找到 CUDA wheel）。
+        #
+        # 历史踩坑（v1.3.12 第二轮）：之前默认 mirror 用阿里 ``mirrors.aliyun.com
+        # /pytorch-wheels/cuXXX/``，实测是阿里云镜像门户 HTML 页面（含 React/JS/广告
+        # /SEO 标签），**不是 PEP 503 索引**，pip ``-f`` find-links 模式扒不出 wheel
+        # 链接。改默认走 PyTorch 官方（标准 PEP 503）；国内用户需配代理或在设置
+        # 页改 mirror 字段指向自建源（必须 PEP 503 兼容）。
+        #
+        # 同时 cuda_version 默认从 cu121 改 cu124：PyTorch 官方 cu121 没有 cp313 +
+        # win_amd64 wheel（cp313 是 Python 3.13 标签），cu124 才有。
+        #
+        # --force-reinstall：强制替换 Step 1 拉的 CPU wheel；不加的话 pip 看到
+        # 已装 CPU torch 版本号 ≥ cuda 源里的，就 skip 不动。
+        # --no-deps：避免重新拉 numpy / sympy / typing-extensions 等已装依赖
+        # （Step 2 单独 pin）；torchvision 跟 torch 必须从同 index 拉避免错配。
+        cuda_url = f"{pytorch_mirror}{cuda_version}"
+        cuda_step = (
+            "# Step 1.5（cuda only）：force-reinstall torch/torchvision 为 CUDA wheel\n"
+            "r = subprocess.call([PY, '-m', 'pip', 'install', '--upgrade',"
+            " '--force-reinstall', '--no-deps',"
+            f" '--index-url', {cuda_url!r}, 'torch', 'torchvision'])\n"
+            "if r != 0:\n"
+            "    sys.exit(r)\n"
+        )
+    return (
+        "import subprocess, sys\n"
+        "MIRROR = ['--index-url', 'https://pypi.tuna.tsinghua.edu.cn/simple/',"
+        " '--extra-index-url', 'https://pypi.org/simple/']\n"
+        "PY = sys.executable\n"
+        # Step 1：装 infinity-emb 全套依赖（pip 自己拉 numpy 1.26 / click 8.4 +
+        # CPU torch wheel；CUDA 用户在 Step 1.5 替换）
+        "r = subprocess.call([PY, '-m', 'pip', 'install', *MIRROR,"
+        " 'infinity-emb[server,torch]', 'huggingface_hub<1.0'])\n"
+        "if r != 0:\n"
+        "    sys.exit(r)\n"
+        + cuda_step +
+        # Step 2：force upgrade Python 3.13 + Win 兼容必需 pin
+        # pip 第 N 次只看新装包之间约束，不再考虑已装 infinity-emb metadata，
+        # 所以能装上 numpy 2.5 / click 8.1（只 warning 不 fail）
+        #
+        # 2026-07-02 numpy pin 条件化 + P1-3 收紧（v2）：
+        # - Python >=3.10：强升 numpy>=2.1 修 Python 3.13 longdouble 兼容坑
+        #   （memory: project_kb_python313_compat.md）+ pin click<8.2 修 typer 兼容
+        # - Python <3.10（macOS 系统 3.9）：**完全不动 numpy**。infinity-emb 0.0.77
+        #   metadata 硬约束 `numpy<2`，Step 1 拉的 1.26.x 天然符合；py3.9 上
+        #   numpy 天花板 2.0.2 且 --upgrade 会尝试升到 2.0.2 破坏 metadata。
+        #   只 pin click<8.2 兜住 typer 兼容（跟 py 版本无关）。
+        "if sys.version_info >= (3, 10):\n"
+        "    r = subprocess.call([PY, '-m', 'pip', 'install', '--upgrade', *MIRROR,"
+        " 'numpy>=2.1,<2.3', 'click<8.2'])\n"
+        "else:\n"
+        "    r = subprocess.call([PY, '-m', 'pip', 'install', '--upgrade', *MIRROR,"
+        " 'click<8.2'])\n"
+        "sys.exit(r)\n"
+    )
+
+
 def build_install_plan(
     model_key: str,
     data_root: str,
@@ -197,14 +309,22 @@ def build_install_plan(
     device: str | None = None,
     detected_cuda: bool | None = None,
     mirror: str | None = "https://hf-mirror.com",
+    pytorch_mirror: str | None = None,
+    cuda_version: str | None = None,
 ) -> InstallPlan:
     """生成交给壳层执行的安装计划（不执行任何下载 / 进程动作）。
 
     data_root 下布局：embedding-service/venv、models/{key}（与 design §3.1 一致）。
     device 留空时按 resolve_device 裁决（壳层探测结果 / cpu 兜底）。
+    pytorch_mirror + cuda_version：仅 device=cuda 时影响 pip 命令（cpu / mps 忽略），
+    拼成 ``{pytorch_mirror}{cuda_version}/`` 作为 find-links 源。默认阿里 + cu121
+    覆盖 95% 现役 NVIDIA GPU；海外用户可改 https://download.pytorch.org/whl/，
+    老驱动（<530）用户改 cu118。
     """
     spec = resolve_model(model_key)
     resolved_device = resolve_device(device, detected_cuda=detected_cuda)
+    pytorch_mirror = _normalize_pytorch_mirror(pytorch_mirror)
+    cuda_version = _normalize_cuda_version(cuda_version)
 
     root = Path(data_root)
     venv_dir = root / "embedding-service" / "venv"
@@ -223,7 +343,7 @@ def build_install_plan(
         device=resolved_device,
         port=DEFAULT_EMBEDDING_PORT,
         create_venv_cmd=["python", "-m", "venv", str(venv_dir)],
-        # 装 [server,torch]（双 extras 实测够用，全套踩坑见下）+ 升级 pip：
+        # 装 [server,torch]（双 extras 实测够用，全套踩坑见下）：
         #   [server]   v2 启动需要的 FastAPI + uvicorn
         #   [torch]    torch / sentence-transformers（infinity-emb 0.0.77 主依赖
         #              只有 numpy + huggingface_hub，torch 是 optional）
@@ -231,17 +351,36 @@ def build_install_plan(
         #   移除 bettertransformer + optimum 1.x 又跟 transformers 4.49+ 不兼容
         #   = 版本地狱。改用 env INFINITY_BETTERTRANSFORMER=false 关掉
         #   BetterTransformer 探测（acceleration.py:36 第一行直接 return False，
-        #   根本不走 optimum 代码）—— env 在 plan.env 里下发给 Swift StartHandler。
+        #   根本不走 optimum 代码）—— env 在 plan.env 里下发给壳层 StartHandler。
         # 避开 [all]：vision/ct2/audio/tensorrt/onnxruntime-gpu 全拉触发
         #   pip resolver backtrack 几十分钟（1.3.5 实测踩过）。
         # huggingface_hub<1.0：infinity-emb 代码 `from huggingface_hub import
         #   HfFolder`，hf_hub 1.0+ 移除该 API。pin 避开 ImportError。
-        # /bin/sh -c 串两步：先升级 pip（venv 默认 pip 21.2.4 resolver 太旧），
-        #   再用新 pip 装 infinity-emb。两条独立命令，避免 race。
+        #
+        # 改 venv_python -c "<script>" 不再 /bin/sh -c：
+        #   - Windows 没 /bin/sh，sh-c 直接 FileNotFoundError；改用 venv 自带
+        #     python 跑内联 script 跨平台一致（Mac venv/bin/python + Win
+        #     venv/Scripts/python.exe 由壳层路径翻译）。
+        #   - script 内 subprocess.call 串两步：先装 infinity-emb 全套(让 pip
+        #     自己拉依赖,含 numpy 1.26 + click 8.4),后 force-upgrade
+        #     numpy>=2.1 + click<8.2(Python 3.13 + Win 必需 pin,见下)。
+        #   - 不能一条 pip install 同时指定:infinity-emb 0.0.77 metadata 锁
+        #     numpy<2,pip resolver 会拒;但 0.0.77 runtime 跟 numpy 2.5 实测
+        #     兼容(import + serving 验证过),拆两步绕开 resolver 强校验。
+        # 依赖 pin 必须性：
+        #   - numpy>=2.1：numpy 1.x 在 Python 3.13 Win 上 longdouble 初始化撞
+        #     OverflowError("cannot convert longdouble infinity to integer"),
+        #     numpy 2.1 首个支持 Py 3.13。Mac 3.11/3.12 当前不撞,3.13 升上来必撞。
+        #   - click<8.2：click 8.2+ Parameter 校验改了,典 typer 0.12 调用方式
+        #     撞 TypeError("Secondary flag is not valid for non-boolean flag"),
+        #     infinity-emb CLI 启动直接崩。Mac 3.11/3.12 拉到的 click 通常是 8.1.x
+        #     不撞,3.13 强制最新 click 8.4 必撞。
+        # 国内镜像：清华源主+PyPI 兜底（torch 123MB PyPI 直连国内常断流；清华
+        #   5-10 MB/s 30 秒下完。海外用户访问清华源 CDN 也通，PyPI 留 extra
+        #   防清华偶发缺包；不影响功能）。
         pip_install_cmd=[
-            "/bin/sh", "-c",
-            f"{venv_python} -m pip install --upgrade pip && "
-            f"{venv_python} -m pip install 'infinity-emb[server,torch]' 'huggingface_hub<1.0'",
+            venv_python, "-c",
+            _build_pip_inline_script(resolved_device, pytorch_mirror, cuda_version),
         ],
         download_args={
             "repo_id": spec.model_id,

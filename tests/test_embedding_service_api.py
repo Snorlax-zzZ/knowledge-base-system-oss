@@ -250,6 +250,83 @@ class TestActualStateEndpoint:
         )
         assert r.status_code == 422
 
+    def test_running_actual_syncs_port_and_dim_to_db_config(self, client):
+        """2026-07-01 bug fix：actual-state 回写 running=True + port>0 时，
+        必须自动 sync 到 system_config，让 kb-api VectorIndex 走真 embedding
+        而不是 hash fallback（老 bug：install 后 port 保持 0/dim 保持 384，
+        VectorIndex 每次 embed 都撞 base_url 空 → 静默 HashEmbedding，
+        install_status.json completed 但语义搜索假 work）。
+        """
+        # seed DB config：mode=local + model=bge-m3；port/dim 保留默认 0 / 384
+        cfg = client.get("/v1/system/config").json()
+        cfg["embedding_service_mode"] = "local"
+        cfg["embedding_service_model_id"] = "bge-m3"
+        cfg["confirm_reindex"] = "I-CONFIRM-REINDEX"  # mode/model 变触发 §2.9
+        assert client.put("/v1/system/config", json=cfg).status_code == 200
+
+        pre = client.get("/v1/system/config").json()
+        assert pre["embedding_service_port"] == 0
+        assert pre["embedding_dim"] == 384
+        assert pre["embedding_enabled"] is False
+
+        # 壳层回写 running=True port=7687（infinity 起来后的心跳）
+        r = self._post_actual(
+            client, _owner_token(),
+            generation=1, installed=True, running=True,
+            model_id="D:\\KnowledgeBase\\models\\bge-m3", port=7687,
+            device="cuda",
+        )
+        assert r.status_code == 200
+
+        # 期望：port/dim/enabled 全被 sync
+        after = client.get("/v1/system/config").json()
+        assert after["embedding_service_port"] == 7687
+        assert after["embedding_dim"] == 1024, "bge-m3 的 dim 必须从 MODEL_REGISTRY 拿到 1024"
+        assert after["embedding_enabled"] is True
+
+    def test_actual_state_not_running_does_not_touch_config(self, client):
+        """running=False 时不能动 DB config（防未 ready 时 flapping 反复覆盖）。"""
+        cfg = client.get("/v1/system/config").json()
+        cfg["embedding_service_mode"] = "local"
+        cfg["embedding_service_model_id"] = "bge-m3"
+        cfg["confirm_reindex"] = "I-CONFIRM-REINDEX"
+        assert client.put("/v1/system/config", json=cfg).status_code == 200
+
+        r = self._post_actual(
+            client, _owner_token(),
+            generation=1, installed=True, running=False,
+            port=7687,  # 有 port 但 running=False
+            last_error="infinity exited during warmup with code 3",
+        )
+        assert r.status_code == 200
+
+        after = client.get("/v1/system/config").json()
+        assert after["embedding_service_port"] == 0
+        assert after["embedding_dim"] == 384
+        assert after["embedding_enabled"] is False
+
+    def test_running_actual_sync_is_idempotent(self, client):
+        """同样的 running actual 多次回写 config 不应重复变化（幂等）。"""
+        cfg = client.get("/v1/system/config").json()
+        cfg["embedding_service_mode"] = "local"
+        cfg["embedding_service_model_id"] = "bge-m3"
+        cfg["confirm_reindex"] = "I-CONFIRM-REINDEX"
+        assert client.put("/v1/system/config", json=cfg).status_code == 200
+
+        token = _owner_token()
+        for gen in (1, 2, 3):
+            r = self._post_actual(
+                client, token,
+                generation=gen, installed=True, running=True,
+                port=7687, device="cuda",
+            )
+            assert r.status_code == 200
+
+        after = client.get("/v1/system/config").json()
+        assert after["embedding_service_port"] == 7687
+        assert after["embedding_dim"] == 1024
+        assert after["embedding_enabled"] is True
+
 
 # ---------------------------------------------------------------------------
 # POST install / start / stop —— 编排端点
@@ -915,8 +992,9 @@ class TestInstallPlanEndpoint:
         assert body["model_key"] == "bge-m3"
         assert body["dim"] == 1024
         assert body["device"] == "cpu"  # 默认 cpu，与 query 不传 device 一致
-        assert body["venv_dir"].endswith("embedding-service/venv")
-        assert body["model_dir"].endswith("models/bge-m3")
+        # Windows 用反斜杠，Mac/Linux 用正斜杠——归一化后断言
+        assert body["venv_dir"].replace("\\", "/").endswith("embedding-service/venv")
+        assert body["model_dir"].replace("\\", "/").endswith("models/bge-m3")
         # 命令是 list[str]，Swift JSONDecoder 直接 [String]
         assert isinstance(body["create_venv_cmd"], list)
         assert isinstance(body["pip_install_cmd"], list)

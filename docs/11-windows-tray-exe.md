@@ -46,9 +46,9 @@
 
 | 工具 | 路径 | 说明 |
 |------|------|------|
-| Python 虚拟环境 | `<install-dir>\.venv` | 安装 requirements-local.txt |
-| Anaconda DLL | `<your-anaconda-path>\Library\bin` | ffi.dll、libexpat.dll 等 |
-| Inno Setup 6 | `<your-inno-setup-path>\ISCC.exe` | 打包安装程序 |
+| Python 虚拟环境 | `F:\knowledge-base-system\.venv` | 安装 requirements-local.txt |
+| Anaconda DLL | `E:\anaconda\Library\bin` | ffi.dll、libexpat.dll 等 |
+| Inno Setup 6 | `E:\Inno Setup 6\ISCC.exe` | 打包安装程序 |
 
 ---
 

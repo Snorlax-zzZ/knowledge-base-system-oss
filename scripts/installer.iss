@@ -3,9 +3,15 @@
 
 #define AppName "百变怪芝士包"
 #ifndef AppVersion
-  #define AppVersion "1.2.8"
+  #define AppVersion "1.3.13"
 #endif
-#define AppExeName "kb-tray.exe"
+; AppExeName 含 onedir 子目录:PyInstaller onedir 输出
+; bin\kb-tray\kb-tray.exe + bin\kb-tray\_internal\... (PyInstaller 6.x 结构)。
+; onefile→onedir 是 1.3.12 的根治方案,避免 onefile 解压到 %TEMP%\_MEIxxxxx\
+; 后被系统/用户清理(macOS launchd 3 天清,Windows 清理工具/手动清 TEMP 同款)
+; 触发 /console 404(static/ HTML 被清,进程持有 .dll 不被清,典型 mismatch)。
+; onedir 跟 exe 一起装到 install root,系统不会动 → 永不撞这个坑。
+#define AppExeName "kb-tray\kb-tray.exe"
 #define RootDir ".."
 
 [Setup]
@@ -14,7 +20,11 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher=knowledge-base-system
-DefaultDirName={localappdata}\KnowledgeBase
+; 默认安装路径走 [Code] 段 GetDefaultInstallDir 动态决定：
+; ASCII 循环 D-Z 找第一个存在的非 C 盘 → {drive}\KnowledgeBase；都没找到
+; 退到 {userdocs}\KnowledgeBase。不在脚本里写死任何具体盘符——
+; 默认值取决于用户机器实际配置，用户仍可在向导 dir page 手选其他位置。
+DefaultDirName={code:GetDefaultInstallDir}
 DefaultGroupName={#AppName}
 AllowNoIcons=yes
 ; 强制显示「选择安装位置 / 开始菜单文件夹」向导页，
@@ -29,7 +39,9 @@ SetupIconFile={#RootDir}\windows-app\assets\app.ico
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-; 不需要管理员权限，安装到 localappdata
+; lowest = 默认低权限,装到用户能写的目录;若用户在向导改成 D:\KnowledgeBase
+; 这种需 admin 写权限的位置,PrivilegesRequiredOverridesAllowed=dialog 会让
+; Inno 自动弹 UAC elevate 提示
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 ; 最低 Windows 10
@@ -42,9 +54,11 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务:"; Flags: unchecked
 
 [Files]
-; 核心程序
-Source: "{#RootDir}\bin\kb-api.exe";   DestDir: "{app}\bin"; Flags: ignoreversion
-Source: "{#RootDir}\bin\kb-tray.exe";  DestDir: "{app}\bin"; Flags: ignoreversion
+; 核心程序(onedir 模式,递归打包整个目录含 _internal/ 子目录)
+; bin\kb-api\kb-api.exe + bin\kb-api\_internal\<.dlls/.pyds/app/static>
+; bin\kb-tray\kb-tray.exe + bin\kb-tray\_internal\<.dlls/.pyds/assets>
+Source: "{#RootDir}\bin\kb-api\*";   DestDir: "{app}\bin\kb-api";  Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#RootDir}\bin\kb-tray\*";  DestDir: "{app}\bin\kb-tray"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; 图标（供快捷方式使用）
 Source: "{#RootDir}\windows-app\assets\app.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; 引导配置 — 首次安装写入，升级时保留用户已修改的版本
@@ -57,6 +71,14 @@ Source: "{#RootDir}\VERSION"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RootDir}\scripts\local-restart-direct.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 ; Agent 接入工具包
 Source: "{#RootDir}\agent-integration\*"; DestDir: "{app}\agent-integration"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[InstallDelete]
+; 1.3.12 onefile→onedir 迁移:删 1.3.11 及以前的 bin\kb-api.exe + bin\kb-tray.exe
+; 旧 onefile 单 exe 文件,新版变成 bin\kb-api\ + bin\kb-tray\ 目录。Inno 默认
+; 不删 [Files] 段没列的文件,旧 .exe 不删会跟新目录共存(用户搞不清哪个是当前
+; 版本,任务管理器看 exe 路径也乱)。升级路径必须显式清旧 onefile 残留。
+Type: files; Name: "{app}\bin\kb-api.exe"
+Type: files; Name: "{app}\bin\kb-tray.exe"
 
 [Dirs]
 ; 运行时目录，预先建好避免权限问题
@@ -95,6 +117,40 @@ Type: filesandordirs; Name: "{app}\runtime"
 // 2. PrepareToInstall —— 升级场景下，先 cp {app}\data 到
 //    {localappdata}\KnowledgeBase\auto-backup\{时间戳}\data，失败则 abort，
 //    不动任何旧文件（与 mac 端 #3 审计修复一致）
+//
+// 关于 Mac 端 bug 5（升级丢 4.3GB models + venv）的 Windows 等价处理：
+// Mac dmg 用 "原子切换" 模式（mv 整个 .app 包）→ 会把 data/models/venv 一起换掉
+// → 必须显式 backup + inject 才能保住。
+//
+// Windows Inno Setup 是 "声明式覆盖" 模式 —— **只动 [Files] 段列的文件**：
+//   - [Files] 段只列了 bin/ + config/ + 使用说明 + VERSION + scripts/ + agent-integration/
+//   - models/ 和 embedding-service/ 不在 [Files] 段 → 升级时 Inno 完全不碰
+//   - [InstallDelete] / [UninstallDelete] 也只清 logs/ 和 runtime/
+// 所以升级时 models/ + embedding-service/ 天然保留，**Windows 不需要 Mac bug 5 同款的
+// backup-inject 两阶段逻辑**。若未来往 [Files] 段加任何写到 {app}\models 或
+// {app}\embedding-service 的条目，需同步扩展 PrepareToInstall 备份范围。
+
+function GetDefaultInstallDir(Param: String): String;
+var
+  i: Integer;
+  drv: String;
+begin
+  // 默认安装路径动态决定:ASCII 循环 D(68) 到 Z(90)找第一个存在的盘根,
+  // 拼 "{drive}\KnowledgeBase" 作为默认值。代码里不写死任何具体盘符——
+  // 默认值由用户机器实际可用盘决定;用户在向导 dir page 仍可改任何位置。
+  // 实在没找到非 C 盘 → 退到 {userdocs}\KnowledgeBase(仍在 C 盘但避开
+  // LocalAppData,提示意味更明显)。
+  for i := 68 to 90 do
+  begin
+    drv := Chr(i) + ':\';
+    if DirExists(drv) then
+    begin
+      Result := drv + 'KnowledgeBase';
+      Exit;
+    end;
+  end;
+  Result := ExpandConstant('{userdocs}\KnowledgeBase');
+end;
 
 function IsProcessRunning(const ExeName: String): Boolean;
 var
@@ -204,8 +260,8 @@ end;
 //   - CurUninstallStepChanged(usPostUninstall) —— Inno 卸载完声明式 [Files] /
 //     [UninstallDelete] 后，按全局 var 删 data / models / embedding-service /
 //     auto-backup；没被选中的目录保留原处，方便重装时找回
-//   - MsgBox 默认按钮：删了找不回的（data / models / auto-backup）默认 No（mb_DefButton2）；
-//     embedding-service venv 可重建，默认 Yes
+//   - 4 个询问用 TaskDialogMsgBox + 自定义 button label：[保留 XXX][确认删除][取消卸载]
+//     语义化 button 避免「是/否」直觉误删；任一弹窗点取消立即 abort 整个卸载流程
 // ----------------------------------------------------------------------------
 
 var
@@ -219,9 +275,30 @@ begin
   Result := ExpandConstant('{localappdata}\KnowledgeBase\auto-backup');
 end;
 
+// 破坏性确认对话框：返 IDYES=保留 / IDNO=确认删除 / IDCANCEL=取消整个卸载。
+// 用 TaskDialogMsgBox + 自定义 button label（Win Vista+ task dialog API），
+// 三 button 语义化避免「是/否」直觉误删（用户扫文字 + 习惯点最左 = 数据丢）。
+//
+// Inno Setup 6 的 TaskDialogMsgBox 只接受纯 button combination 常量
+// （MB_OK / MB_YESNO / MB_YESNOCANCEL 等），不支持 MB_DEFBUTTON* 控制默认聚焦
+// （加上会撞 Runtime error: Invalid Buttons）。所以默认聚焦永远是 Labels[0]
+// = KeepLabel——刚好是 safe default：按 Enter / 直觉点最左 = 保留数据。
+function ConfirmDestructive(const Instruction, Body, KeepLabel, DeleteLabel: String): Integer;
+var
+  Labels: TArrayOfString;
+begin
+  SetArrayLength(Labels, 3);
+  Labels[0] := KeepLabel;
+  Labels[1] := DeleteLabel;
+  Labels[2] := '取消卸载';
+  // ShieldButton=0 表示不给任何 button 加 UAC 盾牌图标
+  Result := TaskDialogMsgBox(Instruction, Body, mbConfirmation, MB_YESNOCANCEL, Labels, 0);
+end;
+
 function InitializeUninstall(): Boolean;
 var
   AppDir, DataDir, ModelsDir, EmbedDir, BackupDir: String;
+  Choice: Integer;
 begin
   Result := True;
 
@@ -248,46 +325,53 @@ begin
   UninstCleanBackup := False;
 
   // 2. 四问 —— 不存在的目录直接跳过，不打扰用户
+  // 任一弹窗点「取消卸载」立即终止整个卸载流程（Result := False）
   if DirExists(DataDir) then
   begin
-    if MsgBox('删除知识库数据吗？' + #13#10 + #13#10 +
-              '路径：' + DataDir + #13#10 +
-              '内容：SQLite 主库 + Qdrant 向量索引' + #13#10 + #13#10 +
-              '⚠ 删除后无法恢复，重装也找不回。' + #13#10 +
-              '默认「否」（保留），建议保留。',
-              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-      UninstCleanData := True;
+    Choice := ConfirmDestructive(
+      '删除知识库数据吗？',
+      '路径：' + DataDir + #13#10 +
+      '内容：SQLite 主库 + Qdrant 向量索引' + #13#10 + #13#10 +
+      '⚠ 删除后无法恢复，重装也找不回。建议保留。',
+      '保留数据', '确认删除');
+    if Choice = IDCANCEL then begin Result := False; Exit; end;
+    if Choice = IDNO then UninstCleanData := True;
   end;
 
   if DirExists(ModelsDir) then
   begin
-    if MsgBox('删除本地模型吗？' + #13#10 + #13#10 +
-              '路径：' + ModelsDir + #13#10 +
-              '内容：已下载的 embedding 模型权重（通常 2~5 GB）' + #13#10 + #13#10 +
-              '删除后重装需重新下载。默认「否」（保留）。',
-              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-      UninstCleanModels := True;
+    Choice := ConfirmDestructive(
+      '删除本地模型吗？',
+      '路径：' + ModelsDir + #13#10 +
+      '内容：已下载的 embedding 模型权重（通常 2~5 GB）' + #13#10 + #13#10 +
+      '删除后重装需重新下载，重装可重建。',
+      '保留模型', '确认删除');
+    if Choice = IDCANCEL then begin Result := False; Exit; end;
+    if Choice = IDNO then UninstCleanModels := True;
   end;
 
   if DirExists(EmbedDir) then
   begin
-    if MsgBox('删除 Embedding 服务运行环境吗？' + #13#10 + #13#10 +
-              '路径：' + EmbedDir + #13#10 +
-              '内容：独立 Python venv（infinity-emb 等依赖）' + #13#10 + #13#10 +
-              '重装时可自动重建。默认「是」（删除）。',
-              mbConfirmation, MB_YESNO) = IDYES then
-      UninstCleanEmbedding := True;
+    Choice := ConfirmDestructive(
+      '删除 Embedding 服务运行环境吗？',
+      '路径：' + EmbedDir + #13#10 +
+      '内容：独立 Python venv（infinity-emb 等依赖）' + #13#10 + #13#10 +
+      '重装时可自动重建。保留也不影响（pip 检测已装依赖会跳过）。',
+      '保留 venv', '确认删除');
+    if Choice = IDCANCEL then begin Result := False; Exit; end;
+    if Choice = IDNO then UninstCleanEmbedding := True;
   end;
 
   if DirExists(BackupDir) then
   begin
-    if MsgBox('删除历史自动备份吗？' + #13#10 + #13#10 +
-              '路径：' + BackupDir + #13#10 +
-              '内容：每次安装 / 升级前自动备份的 data/' + #13#10 + #13#10 +
-              '⚠ 这是最后的救命稻草，删除后无法恢复。' + #13#10 +
-              '默认「否」（保留），建议保留。',
-              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
-      UninstCleanBackup := True;
+    Choice := ConfirmDestructive(
+      '删除历史自动备份吗？',
+      '路径：' + BackupDir + #13#10 +
+      '内容：每次安装 / 升级前自动备份的 data/' + #13#10 + #13#10 +
+      '⚠ 这是最后的救命稻草，删除后无法恢复。强烈建议保留。',
+      '保留备份', '确认删除');
+    if Choice = IDCANCEL then begin Result := False; Exit; end;
+    if Choice = IDNO then UninstCleanBackup := True;
   end;
 end;
 

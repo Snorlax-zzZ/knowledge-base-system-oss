@@ -11,7 +11,7 @@ This handbook is for developers who maintain and extend the knowledge-base-syste
 - `app/service.py`: 业务编排（search / get / upsert + 可选 rerank）。
 - `app/repository_base.py`: 仓储基类，含 `_split_markdown_sections` heading-aware chunking 与 chunk overlap 实现。
 - `app/repository_sqlite.py`: SQLite 仓储（直装版主路径），含全部 6 张表的 DDL 与 backward-compat ALTER 兜底。
-- `app/repository_postgres.py`: PostgreSQL 仓储（代码已实现，等 Docker 版 v1.x 编排 artefact 释出时配合使用）。
+- `app/repository_postgres.py`: PostgreSQL 仓储（代码保留，便于未来恢复 Docker 编排）。
 - `app/vector_index.py`: Qdrant 集成；`pause()` / `resume()` 在备份恢复期间释放文件句柄；embedding provider 不可达自动降级 hash embedding。
 - `app/services/`：横切服务模块。
   - `backup_service.py`：导出 / 导入流式 tarball、`.pre-restore` 双层防护、回滚执行。
@@ -24,7 +24,7 @@ This handbook is for developers who maintain and extend the knowledge-base-syste
 - `app/mcp_server.py` + `app/mcp_tools.py`: 进程内 MCP（直连数据库，开发者调试模式）。
 - `agent-integration/kb-mcp-proxy.py`: MCP HTTP 代理（标准接入方式，stdio → HTTP）。
 - `agent-integration/SKILL.md`: Skill 行为定义；`skills/claude/knowledge-base-first/SKILL.md` 为同步副本，由 `tests/test_skill_sync.py` 守护一致性。
-- `agent-integration/安装说明.md`：用户侧自助接入入口，丢给 Claude Code / Codex 让 AI 自动完成 MCP 注册 + Skill 安装 + 权限白名单合并。
+- `agent-integration/setup_*_mcp.py` / `setup_*_skill.py`: 用户侧安装入口（MCP 与 Skill 分离）。
 - `scripts/`: 导入、备份 / 恢复、平台启停脚本。关键脚本：
   - `kb-start.sh` / `kb-stop.sh` / `kb-status.sh`：macOS 启停（PID file + 端口 + 进程名三重兜底僵尸清理）。
   - `kb-ports.sh`：端口解析（`$KB_PORT_API` env → `config.toml [server].port` → fallback 18000）。

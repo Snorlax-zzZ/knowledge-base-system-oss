@@ -736,17 +736,40 @@
       return;
     }
 
-    // 优先级 3: mode=disabled 或 mode=local 但未安装
+    // 优先级 3: mode=disabled / 未装 / 已装但没跑
+    // 2026-07-01 fix：老逻辑只看 installed 不看 running 会漏 "已装未跑"，
+    // 骗用户"Embedding 好了"但检索实际走 hash fallback（VectorIndex._embed_with_fallback）。
+    // 现在必须 installed && running 才隐藏横幅，其余状态各自出准确文案。
     if (embedStatus) {
-      const fallback = embedStatus.mode === "disabled"
-        || (embedStatus.mode === "local" && !embedStatus.installed);
-      if (fallback) {
+      const mode = embedStatus.mode;
+      const installed = !!embedStatus.installed;
+      const running = !!embedStatus.running;
+      const lastError = String(embedStatus.last_error || "");
+      if (mode === "disabled") {
         show(
           `ℹ️ 未启用 Embedding 服务,当前仅关键词检索。语义检索可在引导页配置。`,
           "#0f172a", "#3b82f6", true
         );
         return;
       }
+      if (mode === "local" && !installed) {
+        show(
+          `ℹ️ Embedding 服务未安装,当前仅关键词检索。请到引导页完成配置。`,
+          "#0f172a", "#3b82f6", true
+        );
+        return;
+      }
+      if (mode === "local" && installed && !running) {
+        const errSlice = lastError ? lastError.slice(0, 80).replace(/[<>&]/g, s => ({'<':'&lt;','>':'&gt;','&':'&amp;'})[s]) : "";
+        const errTail = errSlice ? ` · <span style="color:#fca5a5;">${errSlice}</span>` : "";
+        show(
+          `⚠️ Embedding 服务已安装但未在运行,当前仅关键词检索${errTail}<br>` +
+          `<span style="opacity:.85;">右键托盘 → "▶ 启动 Embedding 服务" 可手动拉起</span>`,
+          "#1e293b", "#f59e0b", false
+        );
+        return;
+      }
+      // installed && running → 真正就绪，不显示横幅
     }
     hide();
   }
