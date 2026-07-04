@@ -2,7 +2,7 @@
 
 ## Mode Scope / 适用模式
 
-本手册以**直装版（SQLite + Qdrant local 嵌入模式）**为主线，覆盖 macOS 与 Windows 两个平台。Docker 版在路线图上（v1.x 计划），编排 artefact 待释出，调用方临时自行编排时可参考本手册做映射。
+本手册以**直装版（SQLite + Qdrant local 嵌入模式）**为主线，覆盖 macOS 与 Windows 两个平台。Docker 编排目前未提供 artefact，调用方自行编排时可参考本手册做映射。
 
 ## 1. Service Topology / 服务拓扑
 
@@ -156,7 +156,7 @@ curl -X POST http://127.0.0.1:18000/v1/system/recover/pre-restore \
 2. `.docx` / `.pdf` 需要 `python-docx` / `pypdf`；PyInstaller 打包时已包含，开发模式需 `pip install`。
 3. 路径越界：报错提示 `KB_DATA_ROOTS` 时，把所在父目录加入 env：
    ```bash
-   export KB_DATA_ROOTS=/Users/<your-username>/work:/tmp/ingest
+   export KB_DATA_ROOTS="$HOME/work:/tmp/ingest"
    ```
 
 ## 6. Capacity Notes / 容量建议

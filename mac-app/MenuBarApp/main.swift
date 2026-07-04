@@ -20,6 +20,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSUserNotificationCent
     private var embeddingManager: EmbeddingProcessManager?
     private var embeddingStarted = false
 
+    // Embedding 手动启动菜单项(对齐 Win 侧 tray_app_local.py "▶ 启动 Embedding 服务"):
+    // installed=true + running=false 时可点,给 auto-bootstrap 失败 / 用户手动 stop 后
+    // 的场景一个不用重启壳层就能重拉 infinity 的兜底通道。
+    private var embeddingStartItem: NSMenuItem!
+    // 点击后到 completion 期间置灰防连点。busy 期间菜单标签置成"启动 Embedding 服务（进行中）"。
+    private var embeddingManualStartInFlight = false
+
     // rebuild 状态轮询的单实例保护：托盘菜单触发重建后开后台 poll，跑到 completed/failed 弹通知；
     // 用户连点不开多个 poller 并发刷屏通知。
     private var rebuildPollerActive = false
@@ -36,18 +43,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSUserNotificationCent
         NSUserNotificationCenter.default.delegate = self
     }
 
+    // 隐藏承载 window：alert 挂 sheet 上不阻塞主 event loop，
+    // 菜单栏"退出"仍能正常响应。alphaValue=0 用户不可见。
+    private var alertHostWindow: NSWindow?
+
     // 用户点击通知（含"显示"按钮）→ 弹 NSAlert 展示完整 title + informativeText
+    // 用 sheet-modal 而非 app-modal（runModal 会阻塞主线程 event loop，
+    // 用户没法点菜单栏"退出"）。
     func userNotificationCenter(
         _ center: NSUserNotificationCenter,
         didActivate notification: NSUserNotification
     ) {
+        let host: NSWindow
+        if let existing = alertHostWindow {
+            host = existing
+        } else {
+            host = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 1, height: 1),
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            host.isReleasedWhenClosed = false
+            host.alphaValue = 0
+            host.level = .floating
+            alertHostWindow = host
+        }
+        host.center()
+        host.orderFrontRegardless()
+
         let alert = NSAlert()
         alert.messageText = notification.title ?? ""
         alert.informativeText = notification.informativeText ?? ""
         alert.alertStyle = .informational
         alert.addButton(withTitle: "好")
         NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
+        alert.beginSheetModal(for: host) { [weak host] _ in
+            host?.orderOut(nil)
+        }
     }
 
     // App 在前台时也强制把通知 banner 弹出来（默认 macOS 会吞掉）
@@ -100,9 +133,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSUserNotificationCent
 
         startItem = makeMenuItem("启动知识库", action: #selector(startKnowledgeBase), symbol: "play.circle")
         stopItem = makeMenuItem("停止知识库", action: #selector(stopKnowledgeBase), symbol: "stop.circle")
+        embeddingStartItem = makeMenuItem("▶ 启动 Embedding 服务", action: #selector(startEmbeddingService), symbol: "sparkles")
+        embeddingStartItem.isEnabled = false  // 默认置灰,refreshEmbeddingMenuState 按实际状态启用
         let statusItemMenu = makeMenuItem("查看状态", action: #selector(showStatus), symbol: "info.circle")
         menu.addItem(startItem)
         menu.addItem(stopItem)
+        menu.addItem(embeddingStartItem)
         menu.addItem(statusItemMenu)
         menu.addItem(.separator())
 
@@ -368,6 +404,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSUserNotificationCent
     @objc private func clearKnowledgeBase() { runOperation(script: "kb-clear.sh", okTitle: "已清空知识库", failTitle: "清空失败") }
     @objc private func cleanExpiredKnowledge() { runOperation(script: "kb-clean-expired.sh", okTitle: "已清理过期知识", failTitle: "清理失败") }
 
+    /// 手动启动 Embedding 服务(对齐 Win 侧 tray_app_local.py:_on_start_embedding)。
+    /// UX 对齐 Win:菜单项条件 = installed=true + running=false 时可点;
+    /// 点击后走 manualStart(config → probe → POST /start,失败 fallback /install repair)。
+    /// 期间菜单项置灰 + 标签追加"（启动中）"防连点,completion 回主线程弹通知 + refresh 状态。
+    @objc private func startEmbeddingService() {
+        guard let mgr = embeddingManager else {
+            notify(title: "启动 Embedding 失败", message: "壳层 manager 未初始化:请先启动知识库,等 kb-api 健康后再试")
+            return
+        }
+        if embeddingManualStartInFlight { return }
+        embeddingManualStartInFlight = true
+        embeddingStartItem.isEnabled = false
+        embeddingStartItem.title = "▶ 启动 Embedding 服务（启动中…）"
+
+        mgr.manualStart { [weak self] result in
+            guard let self = self else { return }
+            self.embeddingManualStartInFlight = false
+            self.embeddingStartItem.title = "▶ 启动 Embedding 服务"
+            switch result {
+            case .success:
+                self.notify(
+                    title: "Embedding 服务启动指令已下发",
+                    message: "warmup 通常 30-60 秒,菜单栏图标翻绿后即可用语义检索。"
+                )
+            case .failure(let error):
+                self.notify(title: "启动 Embedding 失败", message: error.localizedDescription)
+            }
+            // 触发一次状态刷新,让菜单项按新 embedding 状态置灰/启用
+            self.refreshEmbeddingMenuState()
+        }
+    }
+
+    /// 拉 kb-api /v1/system/embedding-service/status,按 Win UX 判定 embeddingStartItem:
+    ///   installed=true + running=false + !warming_up + !inFlight → 可点
+    ///   其他 → 置灰
+    /// 独立于 kb-api 主服务状态(即使 kb-api 停机也能读到"unknown"→置灰)。
+    private func refreshEmbeddingMenuState() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            let port = self.resolvePort()
+            let canStart = self.probeEmbeddingCanManualStart(port: port)
+            DispatchQueue.main.async {
+                guard let item = self.embeddingStartItem else { return }
+                if self.embeddingManualStartInFlight {
+                    item.isEnabled = false
+                    return
+                }
+                item.isEnabled = canStart
+            }
+        }
+    }
+
+    /// 同步(用 semaphore)拉一次 embedding-service/status,判定手动启动是否可用。
+    /// 4s 超时;拉不到时保守置灰,避免菜单项显 enable 但点了报错。
+    private func probeEmbeddingCanManualStart(port: Int) -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/system/embedding-service/status") else {
+            return false
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 4.0
+
+        let sem = DispatchSemaphore(value: 0)
+        var body: Data?
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            body = data
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 5.0)
+
+        guard let data = body,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        let installed = obj["installed"] as? Bool ?? false
+        let running = obj["running"] as? Bool ?? false
+        let warmingUp = obj["warming_up"] as? Bool ?? false
+        return installed && !running && !warmingUp
+    }
+
     /// 触发全量向量索引重建（strict mode）：清空 qdrant collection → 流式 embed
     /// 所有 active chunk → 回写 vector_id。期间维护标志置位，写类 API 返 202。
     /// 二次确认 + 后端 confirm token（I-CONFIRM-OVERWRITE）防误触。
@@ -531,6 +647,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSUserNotificationCent
                 } else {
                     self.setState(.stopped)
                 }
+                // 无论 kb-api 状态如何都刷新 embedding 菜单项(kb 停机时 probe 拉空 → 置灰)
+                self.refreshEmbeddingMenuState()
             }
         }
     }

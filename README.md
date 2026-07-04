@@ -1,24 +1,6 @@
 # 百变怪芝士包 / Knowledge Base System
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey.svg)]()
-
 面向工程研发的本地知识记忆系统，让 Claude Code / Codex 在编码时能检索历史决策、排障记录和工程规范。
-
-![AI 编码助手通过 MCP 召回历史决策与修复记忆](assets/readme/hero-flywheel.png)
-
-> Claude Code 通过 MCP 召回当天刚落档的 bug 修复记忆——人写的知识，AI 当天可查。
-
----
-
-## 为啥用这个 / Why use this?
-
-- 🔒 **本地隐私优先**：所有数据（笔记 / 向量索引 / 备份）都存本地，不离开设备；嵌入服务三选一（内置 infinity / 外部 OpenAI 兼容 / 关闭走关键词），完全可控。
-- 🤖 **MCP 原生集成**：开箱即用接 Claude Code / Codex，让 AI 编码时检索你的历史决策、排障笔记、工程规范——把"AI 一问就忘"变成"AI 越用越懂你"。
-- 📦 **双击即用**：Mac DMG / Windows EXE 直装版，零 Docker 零 Python 环境配置门槛，托盘 / 菜单栏 App 管启停。
-- 🎯 **混合检索**：BM25 关键词召回 + Qdrant 向量语义召回 + 可选 Rerank，精确匹配和语义检索全覆盖。
-- 💾 **数据保护**：升级自动备份 + 主动 export/import + maintenance 模式串行化，避免数据损坏；备份恢复支持 overwrite/merge 双模式 + 严格 confirm token 防误触发。
 
 ---
 
@@ -44,42 +26,11 @@
   logs\                       运行时日志
   ```
 
-- 安装结构（macOS，安装到 `/Applications/KnowledgeBase/`）：
-  ```
-  KnowledgeBaseMenuBar.app    菜单栏 App（Swift binary，启动 / 状态徽章 / 知识库管理菜单）
-  bin/kb-api                  FastAPI 服务 binary（PyInstaller 单文件）
-  config/config.toml          引导配置（端口、数据路径）
-  scripts/                    kb-start/kb-stop/kb-status + 知识库管理脚本（kb-import-* 等）
-  agent-integration/          Claude / Codex 接入工具包
-  使用说明.md                  用户手册
-  data/                       运行时数据（knowledge.db + qdrant_local，卸载保留）
-  logs/                       运行时日志（api.log / api.err.log）
-  ```
-  升级自动备份另存 `~/Library/Application Support/KnowledgeBase/auto-backup/`（卸载保留）。
+### Docker 版（代码保留）
 
-### Docker 版（规划中）
-
-Docker 版在路线图上（v1.x 计划），当前先交付直装版主线。代码层面已保留 `KB_BACKEND=postgres` 路径与 `app/repository_postgres.py` 实现，便于未来 Docker 化 / 外部 Postgres 编排。
+仓库当前未提供 `Dockerfile` / `docker-compose.yml` artefact，但代码层面保留 `KB_BACKEND=postgres` 路径与 `app/repository_postgres.py`，便于调用方自行编排（FastAPI + 外部 Postgres + 独立 Qdrant 容器）。
 
 说明：EXE / Mac App 属于直装版交付物，不属于 Docker 版。
-
----
-
-## 下载安装 / Download
-
-### macOS（v1.3.10）
-
-➡️ [KnowledgeBase-mac-direct-1.3.10.dmg](https://github.com/SliverSucks/knowledge-base-system-oss/releases/latest)
-
-下载 DMG → 双击打开 → 双击 `Install.command`，安装到 `/Applications/KnowledgeBase/`。装好后菜单栏出现知识库图标，点「启动知识库」即可。
-
-### Windows（即将发布）
-
-代码已就绪（`windows-app/` + `scripts/build_direct_install.ps1`），**签名安装包构建中**。急需可参考 [docs/11-windows-tray-exe.md](docs/11-windows-tray-exe.md) 自行构建（需 Anaconda + Inno Setup）。
-
-### 所有版本
-
-[Releases 页面](https://github.com/SliverSucks/knowledge-base-system-oss/releases) — 含历史版本归档与发布说明。
 
 ---
 

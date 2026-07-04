@@ -27,7 +27,7 @@ def populated_repo_and_pkg(tmp_path):
             "type": "fact",
             "content_markdown": f"local content {i}",
             "summary": "",
-            "author": "wzt",
+            "author": "test-user",
             "change_note": "",
         })
 
@@ -43,7 +43,7 @@ def populated_repo_and_pkg(tmp_path):
         "type": "fact",
         "content_markdown": "from backup",
         "summary": "",
-        "author": "wzt",
+        "author": "test-user",
         "change_note": "",
     })
     backup_svc = BackupService(

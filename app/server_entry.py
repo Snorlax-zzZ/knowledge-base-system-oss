@@ -26,9 +26,19 @@ except ModuleNotFoundError:
 
 
 def _install_root() -> Path:
+    # 优先 KB_APP_ROOT env(tray spawn kb-api 时注入,见 tray_app_local._do_start);
+    # 这是最可靠的来源,跟 app/main.py:_resolve_data_root 同款约定。
+    env_root = os.environ.get("KB_APP_ROOT", "").strip()
+    if env_root:
+        return Path(env_root)
     if getattr(sys, "frozen", False):
-        # PyInstaller 打包模式：sys.executable = <install_root>\bin\kb-api.exe
-        return Path(sys.executable).parent.parent
+        # PyInstaller onedir (1.3.12+): sys.executable = <install_root>\bin\kb-api\kb-api.exe
+        # PyInstaller onefile (1.3.11-): sys.executable = <install_root>\bin\kb-api.exe
+        # onedir 时 exe_dir.name 是 "kb-api",需多 parent 一层
+        exe_dir = Path(sys.executable).parent
+        if exe_dir.name == "kb-api":
+            return exe_dir.parent.parent
+        return exe_dir.parent
     # 开发模式：app/server_entry.py 位于 <project_root>/app/
     return Path(__file__).parent.parent
 
@@ -41,9 +51,81 @@ def _load_config(root: Path) -> dict:
     return {}
 
 
+def _write_dependency_probe(log_path: Path) -> None:
+    """冷启动早期跑 qdrant_client + 关键传递依赖 probe，把结果落到日志文件。
+
+    2026-07-01 方案 4：不用等 rebuild 才触发才能看到 import 失败。
+    kb-api 每次启动都写一次，覆盖式。写失败任何异常吞掉——probe 是诊断用，
+    不能反过来阻断 kb-api 启动。
+    """
+    import importlib
+    import importlib.util
+    import sys
+    import traceback
+
+    def _spec_origin(mod_name: str) -> dict:
+        try:
+            spec = importlib.util.find_spec(mod_name)
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}: {exc}"}
+        if spec is None:
+            return {"found": False}
+        return {"found": True, "origin": spec.origin}
+
+    def _mod_version(mod_name: str) -> str:
+        try:
+            m = importlib.import_module(mod_name)
+        except Exception as exc:
+            return f"IMPORT_FAILED: {type(exc).__name__}: {exc}"
+        return str(getattr(m, "__version__", "?"))
+
+    report: dict = {
+        "frozen": getattr(sys, "frozen", False),
+        "meipass": getattr(sys, "_MEIPASS", None),
+        "executable": sys.executable,
+        "sys_path_head": sys.path[:16],
+        "specs": {
+            name: _spec_origin(name)
+            for name in ("qdrant_client", "grpc", "pydantic", "google.protobuf", "numpy", "portalocker")
+        },
+        "versions": {
+            name: _mod_version(name)
+            for name in ("pydantic", "grpc", "numpy", "portalocker")
+        },
+    }
+
+    qdrant_ok = False
+    qdrant_error: str | None = None
+    try:
+        import qdrant_client  # noqa: F401
+        from qdrant_client import QdrantClient, models  # noqa: F401
+        qdrant_ok = True
+    except Exception as exc:
+        qdrant_error = f"{type(exc).__name__}: {exc}\n" + traceback.format_exc()
+    report["qdrant_import_ok"] = qdrant_ok
+    report["qdrant_import_error"] = qdrant_error
+
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        import json
+        log_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        # 落盘失败也不阻断启动
+        pass
+
+
 def main() -> None:
     root = _install_root()
     cfg = _load_config(root)
+    # 方案 4：frozen 冷启动早期 probe qdrant_client + 关键传递依赖，落 log
+    # 让用户一启动就有依赖状态证据，不用等 rebuild 才触发才能看到 import 失败。
+    _write_dependency_probe(root / "logs" / "qdrant-import-probe.log")
+
+    # 构建机 pre-ship 自测入口（build_direct_install.ps1 里 setenv KB_PROBE_ONLY=1
+    # 起一次 kb-api.exe → probe 落盘 → 立即退出）。生产不会设这个 env。
+    if os.environ.get("KB_PROBE_ONLY") == "1":
+        print("[server-entry] KB_PROBE_ONLY=1, exited after probe")
+        sys.exit(0)
 
     server_cfg = cfg.get("server", {})
     data_cfg = cfg.get("data", {})

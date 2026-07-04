@@ -3,7 +3,7 @@
 ## Deployment Modes / 部署模式
 
 - 直装版：`KB_BACKEND=sqlite`，主存为 SQLite，Qdrant 使用 local 模式，由托盘 / 菜单栏 App 管理 `kb-api` 进程生命周期。
-- Docker 版（规划中，v1.x 计划）：`KB_BACKEND=postgres`，主存为 PostgreSQL，Qdrant 使用 server 模式，由 `docker compose` 编排（代码路径已实现，编排 artefact 待释出）。
+- Docker 版：`KB_BACKEND=postgres`，主存为 PostgreSQL，Qdrant 使用 server 模式，由 `docker compose` 编排。
 - 同一套 API / MCP / 检索逻辑在两种模式下保持一致，差异仅在存储后端与启动壳层。
 
 ## Process Model / 进程模型
@@ -35,12 +35,12 @@
 
 2. Knowledge Storage (Primary) / 主存层
    - 直装版：SQLite（`data/knowledge.db`），单文件，安装时 auto-backup。
-   - Docker 版（规划中）：PostgreSQL（待提供 `docker compose` 编排）。
+   - Docker 版：PostgreSQL（`docker compose` 起的 db 容器）。
    - 表结构详见 `docs/03-data-model.md`。
 
 3. Vector Index (Secondary) / 向量索引层
    - 直装版：Qdrant local 模式，落地到 `data/qdrant_local/`。
-   - Docker 版（规划中）：Qdrant server，独立容器。
+   - Docker 版：Qdrant server，独立容器。
    - 备份 / 恢复期间 `VectorIndex.pause()` 暂停写入并释放文件句柄，避免 `cp -R qdrant_local` 与运行中实例并发。
    - Embedding provider 不可达时，自动降级到 hash embedding，保证检索链路不中断。
 

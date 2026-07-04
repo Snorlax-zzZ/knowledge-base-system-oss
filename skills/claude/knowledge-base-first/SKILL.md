@@ -23,10 +23,11 @@ description: 在工程开发任务中优先检索 knowledge-base-system 知识�
 - `mcp__knowledge-base-system__search_knowledge`
 - `mcp__knowledge-base-system__get_knowledge_item`
 
-按需使用（写入场景）：
+按需使用（写入 / 导出场景）：
 
 - `mcp__knowledge-base-system__upsert_knowledge`
 - `mcp__knowledge-base-system__import_incremental_knowledge`
+- `mcp__knowledge-base-system__export_knowledge_package`
 
 高风险操作（必须用户明确要求后再做）：
 

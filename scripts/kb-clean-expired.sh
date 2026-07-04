@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# NOTE (2026-07-02 X2.5 refactor):
+# 此脚本作为 CLI + Mac MenuBar 便利工具保留。
+# API endpoint /v1/knowledge/cleanup-expired 契约已迁移到
+# app/services/knowledge_package.py + app/services/knowledge_clear.py。
+# shell 版和 Python 版严格等语义(tarball 结构、stdout 输出、行为契约一致),
+# 详见 docs/_review_inputs/2026-07-02-tarball-format-audit.md。
 set -euo pipefail
 
 MODE="archive"

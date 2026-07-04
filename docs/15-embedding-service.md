@@ -6,6 +6,7 @@
 >
 > **相关文档**：
 > - [docs/14-phase3-process-manager-contract.md](14-phase3-process-manager-contract.md) — 壳层 ProcessManager 契约（Mac/Windows 实现共用）
+> - [openspec/changes/embedded-embedding-service/design.md](../openspec/changes/embedded-embedding-service/design.md) — 完整设计文档 v1.2 + 27 条 AC
 
 ---
 
@@ -75,7 +76,7 @@
 
 ## 4. 控制平面 API
 
-详见 `app/main.py`。简表：
+详见 `app/main.py` + `openspec/changes/embedded-embedding-service/design.md` §3.2。简表：
 
 | 方法 | 路径 | 说明 |
 |------|------|------|

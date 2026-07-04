@@ -62,7 +62,11 @@ class InstallSseStreamer:
         pip_log_path: Path,
         heartbeat_sec: float = 15.0,
         tail_interval_sec: float = 0.2,
-        max_duration_sec: float = 1800.0,
+        # 硬上限：cuda wheel 2.5GB 在国内慢网（500KB/s 直连 PyTorch CloudFront）
+        # 实测 85 分钟才下完，1800s 远不够；提到 7200s (2h) 覆盖 99% 用户。
+        # 真撞 2h 还没完的属网络问题（< 350KB/s），UI 给 timeout 提示后由前端
+        # fallback 主动 poll status.json 兜底（防 UI 永远卡死，v1.3.12 实测 bug）。
+        max_duration_sec: float = 7200.0,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:

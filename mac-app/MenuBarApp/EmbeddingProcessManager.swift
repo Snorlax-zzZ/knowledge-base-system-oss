@@ -183,6 +183,46 @@ final class KbApiClient {
         )
     }
 
+    /// 2026-07-01 auto-bootstrap 用:拉 /v1/system/config 拿 embedding_service_model_id
+    /// + embedding_service_device,决定 /start POST 的参数(2026-07-02 从 /install 切到 /start)。
+    /// 这个 endpoint 不校验 owner_token,但 doRequest 带 token 无副作用。
+    func getSystemConfig() throws -> [String: Any] {
+        return try doRequest(method: "GET", path: "/v1/system/config", payload: nil)
+    }
+
+    /// 2026-07-02 auto-bootstrap 用:POST /v1/system/embedding-service/start
+    /// 让 kb-api bump desired-state 到 start,reconcile loop 直接跑 doStart 起 infinity,
+    /// 不走 install 环节(避免撞 pip 重装 / numpy pin 兼容问题)。
+    /// 前提:壳层已用 filesystemSaysInstalled() + venvDepsReady() 确认 venv 完整。
+    /// 需要 owner_token(内部端点)。
+    ///
+    /// device P1-2 fix(2026-07-02):auto-bootstrap 场景 desired 归零,不显式传
+    /// device 会让 kb-api 走 "cpu" 兜底吞掉 DB 里的 mps/cuda 配置。传空串让 kb-api
+    /// 走"prev.device > DB config > cpu" 三级兜底(main.py post_embedding_service_start)。
+    func postStart(modelId: String, device: String = "") throws {
+        var payload: [String: Any] = ["model_id": modelId]
+        if !device.isEmpty {
+            payload["device"] = device
+        }
+        _ = try doRequest(
+            method: "POST",
+            path: "/v1/system/embedding-service/start",
+            payload: payload
+        )
+    }
+
+    /// 2026-07-02 auto-bootstrap fallback 用:POST /v1/system/embedding-service/install
+    /// 让 kb-api bump desired=install,reconcile loop 走 doInstall(有 venvDepsReady skip
+    /// 保护半装 venv → repair pip 缺失包)。仅在 auto-bootstrap 前置 probe 失败时调,
+    /// 走 install repair 路径,避免用户装机后半装 venv 起 infinity 挂。
+    func postInstall(modelId: String, device: String) throws {
+        _ = try doRequest(
+            method: "POST",
+            path: "/v1/system/embedding-service/install",
+            payload: ["model_id": modelId, "device": device]
+        )
+    }
+
     // MARK: - 内部 IO
 
     private func doRequest(
@@ -226,9 +266,13 @@ final class KbApiClient {
         if let e = responseError {
             throw EmbedError.kbApiTransport("transport failure: \(e)")
         }
-        if statusCode == 401 {
+        if statusCode == 401 || statusCode == 403 {
+            // 兼容 kb-api owner_token mismatch 返 403 的情况(app/main.py:878/1020):
+            // kb-api 单独重启后 token 会换,壳层缓存的旧 token 命中 403,必须 invalidate 触发下次重读。
+            // 401 是"未认证"(缓存 token 缺失),403 是"认证过但 token 不对"(缓存脏了),
+            // 两个 case 对壳层来说处理方式一致:清缓存 + 抛异常让 caller retry。
             tokenSource.invalidate()
-            throw EmbedError.kbApiUnauthorized("\(method) \(path) -> 401")
+            throw EmbedError.kbApiUnauthorized("\(method) \(path) -> \(statusCode)")
         }
         if statusCode == 409 {
             throw EmbedError.kbApiConflict("\(method) \(path) -> 409")
@@ -308,7 +352,10 @@ struct CommandResult {
 }
 
 final class ProcessRunner {
-    func run(_ cmd: [String], logPath: URL? = nil) -> CommandResult {
+    /// timeout 传 nil 表示无超时(waitUntilExit),传 >0 秒数超时后 SIGTERM + 再 waitUntilExit。
+    /// 超时视为失败,exit code 用 -1 区分正常 exit;stdoutTail 里追加 "[timeout ${sec}s]"。
+    /// 用途:venvDepsReady 探测 import torch dylib 卡死时不能阻塞 reconcile loop(P2-1)。
+    func run(_ cmd: [String], logPath: URL? = nil, timeout: TimeInterval? = nil) -> CommandResult {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: cmd[0])
         proc.arguments = Array(cmd.dropFirst())
@@ -352,10 +399,30 @@ final class ProcessRunner {
         } catch {
             return CommandResult(exitCode: 127, stdoutTail: "\(error)")
         }
-        proc.waitUntilExit()
+
+        var timedOut = false
+        if let to = timeout, to > 0 {
+            let group = DispatchGroup()
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                proc.waitUntilExit()
+                group.leave()
+            }
+            if group.wait(timeout: .now() + to) == .timedOut {
+                timedOut = true
+                proc.terminate()
+                proc.waitUntilExit()
+            }
+        } else {
+            proc.waitUntilExit()
+        }
         pipe.fileHandleForReading.readabilityHandler = nil
         try? logHandle?.close()
-        let combinedTail = queue.sync { tail.joined() }
+        var combinedTail = queue.sync { tail.joined() }
+        if timedOut {
+            combinedTail += "\n[timeout \(timeout ?? 0)s: process terminated]"
+            return CommandResult(exitCode: -1, stdoutTail: combinedTail)
+        }
         return CommandResult(exitCode: proc.terminationStatus, stdoutTail: combinedTail)
     }
 }
@@ -387,25 +454,43 @@ final class InstallExecutor {
     func execute(_ spec: InstallSpec) -> Bool {
         statusWriter.flush(phase: "preparing", progress: 0.05, message: "准备安装 \(spec.modelId)")
 
-        let venvRes = runner.run(spec.createVenvCmd, logPath: pipLogPath)
-        if venvRes.exitCode != 0 {
-            statusWriter.flush(
-                phase: "failed", progress: 0.05,
-                message: "创建 embedding venv 失败",
-                error: String(venvRes.stdoutTail.suffix(512))
-            )
-            return false
-        }
-        statusWriter.flush(phase: "pip_installing", progress: 0.15, message: "安装 infinity-emb 依赖")
+        // 2026-07-02 skip 短路：venv 已可用(infinity_emb + torch + huggingface_hub
+        // 都 import 得动)时 skip create_venv + pip 步骤。对齐 Win Python 端
+        // embedding_process_manager.py:_venv_deps_ready。
+        // 触发场景：
+        //   1) auto-bootstrap 抢到 /install(理想走 /start,兜底走这里也能过)
+        //   2) 用户手动"重建索引"或"切换模型"到已装模型
+        //   3) 老用户升级 dmg 保留 embedding-service/venv
+        // 不 skip 的代价:pip resolver 会重跑约束求解,pin numpy>=2.1 在 py<3.10
+        // 上必炸(找不到 wheel)。命中场景秒回。
+        let venvSkip = venvDepsReady(venvDir: spec.venvDir)
+        if !venvSkip {
+            let venvRes = runner.run(spec.createVenvCmd, logPath: pipLogPath)
+            if venvRes.exitCode != 0 {
+                statusWriter.flush(
+                    phase: "failed", progress: 0.05,
+                    message: "创建 embedding venv 失败",
+                    error: String(venvRes.stdoutTail.suffix(512))
+                )
+                return false
+            }
+            statusWriter.flush(phase: "pip_installing", progress: 0.15, message: "安装 infinity-emb 依赖")
 
-        let pipRes = runner.run(spec.pipInstallCmd, logPath: pipLogPath)
-        if pipRes.exitCode != 0 {
+            let pipRes = runner.run(spec.pipInstallCmd, logPath: pipLogPath)
+            if pipRes.exitCode != 0 {
+                statusWriter.flush(
+                    phase: "failed", progress: 0.15,
+                    message: "pip install infinity-emb 失败",
+                    error: String(pipRes.stdoutTail.suffix(512))
+                )
+                return false
+            }
+        } else {
+            NSLog("venv deps already importable; skipping create_venv + pip (venv=\(spec.venvDir))")
             statusWriter.flush(
-                phase: "failed", progress: 0.15,
-                message: "pip install infinity-emb 失败",
-                error: String(pipRes.stdoutTail.suffix(512))
+                phase: "downloading", progress: 0.35,
+                message: "检测到 venv 依赖已就绪，跳过 pip 安装"
             )
-            return false
         }
 
         // bug 1 修复：跑 snapshot_download 前先检测 local_dir 是不是已经完整。
@@ -456,6 +541,58 @@ final class InstallExecutor {
 
     /// 检测本地 model 目录是不是包含完整权重，命中即可跳过 snapshot_download。
     ///
+    /// 2026-07-02 强 probe:探 5 个 import + click / numpy 版本校验,识别"Step1 装成
+    /// Step2 失败"的半装 venv(P0 flag)。原轻 probe 只探三包 import,那种半装 venv
+    /// 三包都能 import 但 click 是 8.4 / numpy 也没修正 → 会被误判成"装好"→ 走 skip
+    /// 跳过 Step2 修复 → 起 infinity 撞 typer 兼容坑。
+    ///
+    /// exit code 分级(便于日志诊断):
+    ///   0 = 全过(venv 完整可跑 infinity),skip pip
+    ///   1 = 关键 import 失败(infinity_emb / torch / huggingface_hub / click / typer)
+    ///   2 = click 版本 >= 8.2(需 Step2 pin click<8.2 修 typer 兼容)
+    ///   3 = numpy 版本不符合 py 版本区间约束
+    ///
+    /// 20s timeout 对齐 Win embedding_process_manager.py:_venv_deps_ready(import torch
+    /// 首次 5-10s + 冷启 1-3s,20s 覆盖慢机器)。timeout 视为 exit != 0 走 pip 兜底。
+    fileprivate func venvDepsReady(venvDir: String) -> Bool {
+        let venvPython = "\(venvDir)/bin/python"
+        guard FileManager.default.isExecutableFile(atPath: venvPython) else {
+            return false
+        }
+        // 探测脚本:import 5 个包 + click<8.2 校验 + numpy 按 py 版本校验。
+        // click / numpy 版本用 tuple(int, int) 比较,避字符串比较坑(8.10 vs 8.2)。
+        let probeScript = """
+        import sys
+        try:
+            import infinity_emb, torch, huggingface_hub, click, typer
+            import numpy
+        except ImportError:
+            sys.exit(1)
+        def _v(pkg):
+            parts = pkg.split('.')[:2]
+            try:
+                return tuple(int(p) for p in parts)
+            except ValueError:
+                return (0, 0)
+        if _v(click.__version__) >= (8, 2):
+            sys.exit(2)
+        np_v = _v(numpy.__version__)
+        if sys.version_info >= (3, 10):
+            if np_v < (2, 1):
+                sys.exit(3)
+        else:
+            if np_v >= (2, 0):
+                sys.exit(3)
+        sys.exit(0)
+        """
+        let probeCmd = [venvPython, "-c", probeScript]
+        let res = runner.run(probeCmd, logPath: pipLogPath, timeout: 20.0)
+        if res.exitCode != 0 {
+            NSLog("venvDepsReady: probe failed (exit=\(res.exitCode), venv=\(venvDir))")
+        }
+        return res.exitCode == 0
+    }
+
     /// 判定规则（保守）：config.json 存在 且 至少一份权重文件（.safetensors / .bin / onnx/*.onnx）
     /// 单文件大于 50MB（防止只下了元数据壳就被误判为完整）。
     ///
@@ -466,11 +603,15 @@ final class InstallExecutor {
         let configURL = baseURL.appendingPathComponent("config.json")
         guard fm.fileExists(atPath: configURL.path) else { return false }
 
+        // 只认 PyTorch 权重（跟 Win _is_model_dir_complete 对齐）。
+        // 原因：infinity 启动模板默认 engine=torch，必须 pytorch_model.bin /
+        // model.safetensors；把 onnx/model.onnx_data 也算完整会跳过 snapshot_download
+        // 后 infinity 撞 OSError(no file named pytorch_model.bin, ...)。
+        // Mac 端 device=mps 同样走 torch engine，同样只吃 PyTorch 权重。
+        // (2026-07-01 审计 P1：本次同步收干净，Mac 用户不再踩 Windows 已修过的坑)
         let weightCandidates: [String] = [
             "pytorch_model.bin",
             "model.safetensors",
-            "onnx/model.onnx_data",
-            "onnx/model.onnx",
         ]
         let minWeightBytes: Int64 = 50 * 1024 * 1024  // 50MB
         for rel in weightCandidates {
@@ -489,9 +630,15 @@ final class InstallExecutor {
         let venvPython = "\(spec.venvDir)/bin/python"
         let repoId = spec.downloadArgs["repo_id"] ?? ""
         let localDir = spec.downloadArgs["local_dir"] ?? ""
+        // ignore_patterns：跟 Win _build_download_cmd 对齐。hf-mirror 对 imgs/.DS_Store
+        // 等非权重文件返 403，huggingface_hub 撞 403 会 fallback 到 huggingface.co
+        // → 国内 timeout → 静默返回 local_dir 当作成功，但实际权重根本没下。
+        // 跳过这些无关文件避开 403。
+        // TODO(mac-followup): 加下载后的权重完整性 post-check（对齐 Win InstallExecutor
+        // _download_model 护栏），防 hub 未来出新的静默成功姿势。
         let script = """
         from huggingface_hub import snapshot_download;\
-        snapshot_download(repo_id=\(quoted(repoId)),local_dir=\(quoted(localDir)),endpoint=\(quoted(endpoint)),resume_download=True)
+        snapshot_download(repo_id=\(quoted(repoId)),local_dir=\(quoted(localDir)),endpoint=\(quoted(endpoint)),ignore_patterns=('imgs/*', '*.DS_Store', '.gitattributes'),resume_download=True)
         """
         return [venvPython, "-c", script]
     }
@@ -739,6 +886,10 @@ final class EmbeddingProcessManager {
     let loopPeriodSec: Double
     let heartbeatSec: Double
 
+    // 2026-07-01 auto-bootstrap 需要 dataRoot 读磁盘状态(venv/models/runtime/owner_token)
+    // 对齐 Win Python 端 tray_app_local.py:_maybe_auto_bootstrap_embedding L515。
+    let dataRoot: URL
+
     private let actualLock = NSLock()
     private var actual = EmbedActualState()
     private var currentHandle: InfinityProcess?
@@ -752,6 +903,9 @@ final class EmbeddingProcessManager {
     private var stopFlag = false
     private let workQueue = DispatchQueue(label: "embed.reconcile", qos: .utility)
 
+    // auto-bootstrap 一次性标志(整个 mgr 生命周期只 attempt 一次)
+    private var autoBootstrapAttempted = false
+
     init(
         client: KbApiClient,
         installer: InstallExecutor,
@@ -759,6 +913,7 @@ final class EmbeddingProcessManager {
         stopper: StopHandler,
         cleaner: StaleResidueCleaner,
         specFactory: @escaping EmbedSpecFactory,
+        dataRoot: URL,
         loopPeriodSec: Double = 3.0,
         heartbeatSec: Double = 5.0
     ) {
@@ -768,6 +923,7 @@ final class EmbeddingProcessManager {
         self.stopper = stopper
         self.cleaner = cleaner
         self.specFactory = specFactory
+        self.dataRoot = dataRoot
         self.loopPeriodSec = loopPeriodSec
         self.heartbeatSec = heartbeatSec
     }
@@ -817,6 +973,11 @@ final class EmbeddingProcessManager {
     }
 
     private func tick() throws {
+        // 2026-07-01 auto-bootstrap: kb-api 冷启后 desired-state 内存态归零 → 磁盘上
+        // 明明装了 embedding 但托盘不会自动拉起。方法内部幂等(autoBootstrapAttempted
+        // 一次性标志),对齐 Win Python 端 tray_app_local.py:_maybe_auto_bootstrap_embedding L515。
+        maybeAutoBootstrap()
+
         // bug 2 自愈：StartHandler.spawnAndWaitReady 在 120s 内拿不到 /health 200 时
         // 会返回 (handle, ready=false, "warmup timeout")，actual.warmingUp 会卡 true。
         // 但 infinity 实际可能在 120s 后才完成 model load——此时进程仍在跑、/health 真返
@@ -846,6 +1007,203 @@ final class EmbeddingProcessManager {
         lastDoneGeneration = desired.generation
         writeActual(desired: desired)
     }
+
+    // MARK: - Auto-bootstrap (2026-07-01)
+    // 对齐 Win Python 端 windows-app/tray_app_local.py 的 _maybe_auto_bootstrap_embedding
+    // (L515) + _filesystem_says_installed (L276) + _do_auto_bootstrap_embedding (L570)。
+    // 覆盖 kb-api 冷启后 desired-state 内存态归零(EmbeddingServiceState._desired 是进程
+    // 级单例,无持久化)导致的"重启后 embedding 服务不自动起"问题。
+    // 长期修根:desired-state 落盘持久化(project_kb_restart_state_loss followup)。
+    // 本方法只是保险丝,覆盖用户可见 UX 症状。
+
+    /// 判定是否需要 auto-bootstrap。方法内部幂等(autoBootstrapAttempted 一次性标志),
+    /// 在 reconcile loop 每次 tick 起手被调用,但只有全部命中才真正触发。
+    ///
+    /// 判定链(全命中才触发):
+    /// 1. 本次 mgr 生命周期还没 attempt 过
+    /// 2. 磁盘上 embedding-service/venv/bin/python + models/ 有 PyTorch 权重
+    /// 3. actual 里 running/warmingUp = false(不覆盖已跑起来的服务)
+    /// 4. kb-api desired.action == "none" && !desired.enabled(内存归零态)
+    /// 5. runtime/owner_token 能读到
+    /// 6. 后台线程 POST /v1/system/embedding-service/start 让 kb-api bump desired=start
+    private func maybeAutoBootstrap() {
+        if autoBootstrapAttempted { return }
+        // 1) 磁盘装了吗
+        if !filesystemSaysInstalled() { return }
+        // 2) actual 里已经跑起来了就别动
+        let snap = snapshotActual()
+        if snap.running || snap.warmingUp {
+            autoBootstrapAttempted = true  // 已经好了,标记 attempted 防未来重触发
+            return
+        }
+        // 3) 拉 desired-state 判是不是内存归零态
+        let desired: EmbedDesiredState
+        do {
+            desired = try client.getDesired()
+        } catch {
+            // 拿不到 desired-state 就下轮再试(可能 kb-api 还没起 / token 还没就位)
+            return
+        }
+        if desired.action != "none" || desired.enabled {
+            autoBootstrapAttempted = true  // 有活跃 desired,不覆盖
+            return
+        }
+        // 4) 读 owner_token(auto-bootstrap 完整链路里 token 是 /start POST 必须的)
+        let tokenPath = dataRoot.appendingPathComponent("runtime").appendingPathComponent("owner_token")
+        guard let tokenData = try? String(contentsOf: tokenPath, encoding: .utf8) else { return }
+        let token = tokenData.trimmingCharacters(in: .whitespacesAndNewlines)
+        if token.isEmpty { return }
+        // 5) 触发静默 auto-bootstrap(后台线程,不阻塞 reconcile loop)
+        autoBootstrapAttempted = true
+        NSLog("auto-bootstrap: triggering start (filesystem installed, desired=none, actual not running)")
+        workQueue.async { [weak self] in
+            self?.triggerAutoBootstrapStart(token: token)
+        }
+    }
+
+    /// 磁盘兜底探测:embedding-service/venv/bin/python 存在 +
+    /// models/ 至少一个子目录含 PyTorch 权重(.safetensors/.bin/.pt)。
+    /// 对齐 Win Python 端 tray_app_local.py:_filesystem_says_installed L276。
+    private func filesystemSaysInstalled() -> Bool {
+        let venvPython = dataRoot
+            .appendingPathComponent("embedding-service")
+            .appendingPathComponent("venv")
+            .appendingPathComponent("bin")
+            .appendingPathComponent("python")
+        if !FileManager.default.isExecutableFile(atPath: venvPython.path) {
+            return false
+        }
+        let modelsDir = dataRoot.appendingPathComponent("models")
+        var isDir: ObjCBool = false
+        if !FileManager.default.fileExists(atPath: modelsDir.path, isDirectory: &isDir)
+            || !isDir.boolValue {
+            return false
+        }
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: modelsDir.path) else {
+            return false
+        }
+        for entry in entries {
+            let subdir = modelsDir.appendingPathComponent(entry)
+            var isSubDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: subdir.path, isDirectory: &isSubDir),
+                  isSubDir.boolValue else {
+                continue
+            }
+            guard let modelFiles = try? FileManager.default.contentsOfDirectory(atPath: subdir.path) else {
+                continue
+            }
+            let hasWeights = modelFiles.contains { name in
+                name.hasSuffix(".safetensors") || name.hasSuffix(".bin") || name.hasSuffix(".pt")
+            }
+            if hasWeights { return true }
+        }
+        return false
+    }
+
+    /// 后台线程执行:拉 config 拿 model_id → probe → POST /start 让 kb-api
+    /// bump desired=start,reconcile loop 直接跑 doStart 起 infinity → warmup → running。
+    /// 现薄封装 performStartHandshake,供 auto-bootstrap 路径调用(忽略返回值)。
+    /// 用户可见:横幅平滑消失 + 菜单翻绿(通常 30-60s)。
+    private func triggerAutoBootstrapStart(token: String) {
+        _ = performStartHandshake(token: token)
+    }
+
+    /// UI 手动触发入口(对齐 Win 侧 tray_app_local.py:_on_start_embedding)。
+    /// 完整走 config → probe → POST /start,失败 fallback POST /install repair;
+    /// 结果通过 completion 回调到主线程,由 UI 层弹通知 / 刷新菜单状态。
+    ///
+    /// 跟 maybeAutoBootstrap 的区别:
+    /// - 不判 autoBootstrapAttempted 门槛(用户可多次点重试)
+    /// - 不判 desired.action == "none"(用户明示要起,直接 bump)
+    /// - 完成状态回主线程给 UI 反馈
+    public func manualStart(completion: @escaping (Result<Void, Error>) -> Void) {
+        let tokenPath = dataRoot
+            .appendingPathComponent("runtime")
+            .appendingPathComponent("owner_token")
+        guard let tokenData = try? String(contentsOf: tokenPath, encoding: .utf8) else {
+            DispatchQueue.main.async {
+                completion(.failure(NSError(
+                    domain: "EmbeddingProcessManager",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "读 owner_token 失败:请先启动知识库"]
+                )))
+            }
+            return
+        }
+        let token = tokenData.trimmingCharacters(in: .whitespacesAndNewlines)
+        if token.isEmpty {
+            DispatchQueue.main.async {
+                completion(.failure(NSError(
+                    domain: "EmbeddingProcessManager",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "owner_token 为空:请重启知识库"]
+                )))
+            }
+            return
+        }
+        workQueue.async { [weak self] in
+            guard let self = self else { return }
+            let result = self.performStartHandshake(token: token)
+            DispatchQueue.main.async {
+                completion(result)
+            }
+        }
+    }
+
+    /// auto-bootstrap 与手动触发共用的核心 handshake:
+    /// 1) 拉 config 拿 model_id + device
+    ///    device P1-2 fix(2026-07-02):必须显式读 DB config,防 kb-api desired
+    ///    空态走 "cpu" 兜底吞掉 mps/cuda 配置。传空串走 kb-api 3 级兜底。
+    /// 2) 补 probe 保护:filesystemSaysInstalled 只探 venv/bin/python + 权重,
+    ///    半装 venv(Step1 装成 Step2 fail)会通过;走 /start 会绕过 InstallExecutor
+    ///    里的 venvDepsReady skip → doStart 起 infinity 可能撞 click/numpy 兼容坑。
+    ///    显式跑 venvDepsReady 强 probe,失败 fallback /install repair 路径。
+    ///    (2026-07-02 P0 外部审计 flag)
+    /// 3) probe 通过 → POST /start(带 owner_token,让 kb-api bump desired=start)
+    private func performStartHandshake(token: String) -> Result<Void, Error> {
+        // 1) 拉 config
+        let modelId: String
+        let device: String
+        do {
+            let cfg = try client.getSystemConfig()
+            modelId = (cfg["embedding_service_model_id"] as? String).flatMap {
+                $0.isEmpty ? nil : $0
+            } ?? "bge-m3"
+            device = (cfg["embedding_service_device"] as? String).flatMap {
+                $0.isEmpty ? nil : $0
+            } ?? ""
+        } catch {
+            NSLog("start handshake: getSystemConfig failed: \(error)")
+            return .failure(error)
+        }
+        // 2) probe + fallback /install repair
+        let venvDir = dataRoot
+            .appendingPathComponent("embedding-service")
+            .appendingPathComponent("venv").path
+        let probeOK = installer.venvDepsReady(venvDir: venvDir)
+        if !probeOK {
+            let effectiveDevice = device.isEmpty ? "cpu" : device
+            do {
+                try client.postInstall(modelId: modelId, device: effectiveDevice)
+                NSLog("start handshake: probe failed, fallback /install repair POST (model=\(modelId), device=\(effectiveDevice))")
+                return .success(())
+            } catch {
+                NSLog("start handshake: probe failed AND install fallback POST failed: \(error)")
+                return .failure(error)
+            }
+        }
+        // 3) POST /start
+        do {
+            try client.postStart(modelId: modelId, device: device)
+            NSLog("start handshake: /start POST succeeded (model=\(modelId), device=\(device.isEmpty ? "<default>" : device))")
+            return .success(())
+        } catch {
+            NSLog("start handshake: /start POST failed: \(error)")
+            return .failure(error)
+        }
+    }
+
+    // MARK: - Self-heal (原有逻辑)
 
     /// 当 actual.warmingUp=true 或 lastError 含 warmup 字样、但 process 健康 + /health 200 时，
     /// 重置脏状态。避免用户首次 warmup timeout 后必须手动 stop+start 才能让 banner 变绿。
@@ -888,17 +1246,25 @@ final class EmbeddingProcessManager {
         let (installSpec, startSpec, runtimeDir) = specFactory(desired, snapshotActual())
         switch desired.action {
         case "install":
-            doInstall(desired: desired, spec: installSpec)
+            _ = doInstall(desired: desired, spec: installSpec)
         case "start":
             doStart(desired: desired, spec: startSpec, runtimeDir: runtimeDir)
         case "stop":
             doStop(desired: desired, runtimeDir: runtimeDir)
         case "switch_model":
+            // 2026-07-02 P1-1 fix:install 失败不允许继续 doStart(否则壳层拿旧
+            // 模型的 venv 试图起新模型,启动失败但 actual.installed=false 会导致
+            // 用户 UI 状态混乱)。对齐 Win embedding_process_manager.py:1739 分支。
             doStop(desired: desired, runtimeDir: runtimeDir)
+            var installOK = true
             if let isp = installSpec {
-                doInstall(desired: desired, spec: isp)
+                installOK = doInstall(desired: desired, spec: isp)
             }
-            doStart(desired: desired, spec: startSpec, runtimeDir: runtimeDir)
+            if installOK {
+                doStart(desired: desired, spec: startSpec, runtimeDir: runtimeDir)
+            } else {
+                NSLog("switch_model: install failed, skip doStart to avoid confused state")
+            }
         default:
             actualLock.lock()
             actual.lastError = "unknown action: \(desired.action)"
@@ -906,12 +1272,14 @@ final class EmbeddingProcessManager {
         }
     }
 
-    private func doInstall(desired: EmbedDesiredState, spec: InstallSpec?) {
+    /// 返回 true = install 成功;false = 失败(actual.lastError 已写)。
+    /// 调用方(switch_model)据此决定是否继续 doStart。
+    private func doInstall(desired: EmbedDesiredState, spec: InstallSpec?) -> Bool {
         guard let s = spec else {
             actualLock.lock()
             actual.lastError = "install spec missing"
             actualLock.unlock()
-            return
+            return false
         }
         let ok = installer.execute(s)
         actualLock.lock()
@@ -920,6 +1288,7 @@ final class EmbeddingProcessManager {
         actual.device = desired.device
         actual.lastError = ok ? "" : "install failed (see install_status.json)"
         actualLock.unlock()
+        return ok
     }
 
     private func doStart(desired: EmbedDesiredState, spec: StartSpec?, runtimeDir: URL) {
@@ -1154,6 +1523,7 @@ func buildDefaultEmbeddingManager(
         starter: starter,
         stopper: stopper,
         cleaner: cleaner,
-        specFactory: specFactory
+        specFactory: specFactory,
+        dataRoot: root       // 2026-07-01 auto-bootstrap 需要读磁盘 venv/models/owner_token
     )
 }

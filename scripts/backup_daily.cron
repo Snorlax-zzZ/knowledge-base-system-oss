@@ -1,2 +1,2 @@
 # Run daily backup at 02:30
-30 2 * * * cd <your-install-dir>/knowledge-base-system && ./scripts/backup_create.sh >> <your-install-dir>/knowledge-base-system/backups/backup.log 2>&1
+30 2 * * * cd "$HOME/knowledge-base-system" && ./scripts/backup_create.sh >> "$HOME/knowledge-base-system/backups/backup.log" 2>&1

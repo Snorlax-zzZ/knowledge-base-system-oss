@@ -108,6 +108,29 @@
         </div>
       </div>
 
+      <!-- CUDA 专属字段：device=cuda 时显示，控制 PyTorch wheel 来源 -->
+      <div class="form-row" id="cuda-config-row" style="display:none;">
+        <div style="flex:1 1 100%;">
+          <label for="pytorch-mirror">PyTorch 镜像源</label>
+          <input id="pytorch-mirror" value="https://download.pytorch.org/whl/"
+                 placeholder="https://download.pytorch.org/whl/" />
+          <p class="sub" style="margin-top:4px;">
+            默认 PyTorch 官方索引（PEP 503 标准）；国内裸网慢请配代理，或填自建 PEP 503 兼容源。
+            <strong>不支持</strong>阿里 / 清华 / 上交（HTML 门户页，pip 无法解析）。必须以 <code>/</code> 结尾、<code>https://</code> 开头。
+          </p>
+        </div>
+        <div>
+          <label for="cuda-version">CUDA 版本</label>
+          <select id="cuda-version">
+            <option value="cu118">cu118 (老驱动 ≥450)</option>
+            <option value="cu121">cu121 (驱动 ≥530)</option>
+            <option value="cu124" selected>cu124 (默认,驱动 ≥550)</option>
+            <option value="cu128">cu128 (驱动 ≥570)</option>
+          </select>
+          <p class="sub" style="margin-top:4px;">查看驱动版本：<code>nvidia-smi</code>；Python 3.13 用户建议 cu124+（cu121 无 cp313 win wheel）</p>
+        </div>
+      </div>
+
       <div class="actions">
         <button id="btn-back-to-choose" class="secondary" type="button">返回</button>
         <button id="btn-start-install" type="button" disabled>开始安装</button>
@@ -289,6 +312,15 @@
     document.getElementById("btn-back-to-choose").addEventListener("click", () => showPage("choose"));
     document.getElementById("btn-start-install").addEventListener("click", () => startInstall());
 
+    // device 切换时联动显隐 CUDA 配置字段（仅 cuda 显示 mirror + version）
+    const cudaConfigRow = document.getElementById("cuda-config-row");
+    const deviceSel = document.getElementById("device-sel");
+    const syncCudaConfigVisibility = () => {
+      cudaConfigRow.style.display = deviceSel.value === "cuda" ? "" : "none";
+    };
+    deviceSel.addEventListener("change", syncCudaConfigVisibility);
+    syncCudaConfigVisibility();
+
     // === 第 2b 步:external 保存 ===
     document.getElementById("btn-back-from-external").addEventListener("click", () => showPage("choose"));
     document.getElementById("btn-save-external").addEventListener("click", async () => {
@@ -328,6 +360,10 @@
       document.getElementById("log-area").textContent = "";
 
       const device = document.getElementById("device-sel").value;
+      // device=cuda 时读取 PyTorch wheel 来源；cpu/mps 用默认占位（后端忽略）
+      const pytorchMirror = document.getElementById("pytorch-mirror").value.trim()
+        || "https://download.pytorch.org/whl/";
+      const cudaVersion = document.getElementById("cuda-version").value || "cu124";
 
       // 1. PUT config 切到 mode=local + model
       // PUT /v1/system/config 是「全量替换」语义（schema 里 api_base_url / grafana_url
@@ -349,6 +385,8 @@
         embedding_service_mode: "local",
         embedding_service_model_id: selectedModelKey,
         embedding_service_device: device,
+        embedding_service_pytorch_mirror: pytorchMirror,
+        embedding_service_cuda_version: cudaVersion,
         confirm_reindex: "I-CONFIRM-REINDEX",
       });
       if (!cfgR.ok && cfgR.status !== 409) {
@@ -371,6 +409,8 @@
           body: JSON.stringify({
             model_id: selectedModelKey,
             device: device,
+            pytorch_mirror: pytorchMirror,
+            cuda_version: cudaVersion,
           }),
         });
         if (!resp.ok) {
@@ -452,7 +492,54 @@
         const area = document.getElementById("log-area");
         area.textContent += payload.chunk || "";
         area.scrollTop = area.scrollHeight;
+      } else if (ev === "timeout") {
+        // 后端 SSE 流硬上限触发（默认 2 小时）—— 不代表 install 真失败，
+        // 大 wheel + 慢网可能仍在跑。主动 poll install_status.json 兜底，
+        // 看是不是已经 completed / 还在跑。
+        // 关联：app/services/install_progress.py max_duration_sec
+        document.getElementById("phase-text").innerHTML =
+          `phase: <strong>polling</strong> &nbsp; SSE 超时，主动查实际状态...`;
+        pollInstallStatusFallback();
       }
+    }
+
+    // SSE 超时 fallback：每 5s GET 一次 status，最多 60 次（5 分钟）。
+    // install 真完成 → 跑跟 SSE 同款 completed 流程；真失败 → 报错 + retry。
+    async function pollInstallStatusFallback() {
+      for (let i = 0; i < 60; i++) {
+        if (installCanceled) return;
+        try {
+          const r = await fetch("/v1/system/embedding-service/status");
+          if (r.ok) {
+            const s = await r.json();
+            // status endpoint 用 installed / running 判 install 完成；warming_up 也算成功阶段
+            if (s.installed) {
+              document.getElementById("phase-text").innerHTML =
+                `phase: <strong>completed</strong> &nbsp; 安装完成（SSE 超时但壳层跑完了）`;
+              document.getElementById("progress-bar").style.width = "100%";
+              fetch("/v1/system/embedding-service/start", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({}),
+              }).catch(e => console.warn("auto-start POST failed:", e));
+              setTimeout(() => showPage("done"), 800);
+              return;
+            }
+            if (s.last_error) {
+              setStatus("install-status", "安装失败: " + s.last_error, "err");
+              showRetryUI();
+              return;
+            }
+          }
+        } catch (e) {
+          console.warn("status poll failed:", e);
+        }
+        await new Promise(r => setTimeout(r, 5000));
+      }
+      // 5 分钟兜底 poll 仍没结论 → 让用户决定
+      setStatus("install-status",
+        "SSE 流超时且 5 分钟内仍未完成。可能壳层还在跑，刷新页面或在托盘看实际状态。", "warn");
+      showRetryUI();
     }
 
     function showRetryUI() {

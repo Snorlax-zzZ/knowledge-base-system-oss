@@ -47,6 +47,10 @@ class DesiredState:
     model_id: str = ""        # 目标模型 key（如 "bge-m3"）
     device: str = "cpu"
     enabled: bool = False     # mode=local 时为 True，方便壳层快速判断"该不该跑"
+    # v1.3.12：cuda wheel 安装配置。仅 device=cuda 时影响 pip 命令；cpu/mps 忽略。
+    # 默认值与 SystemConfig / build_install_plan 内部默认保持一致。
+    pytorch_mirror: str = "https://download.pytorch.org/whl/"
+    cuda_version: str = "cu124"
     generation: int = 0
     updated_at: float = 0.0
 
@@ -105,6 +109,8 @@ class EmbeddingServiceState:
         model_id: str = "",
         device: str = "cpu",
         enabled: bool = False,
+        pytorch_mirror: str = "https://download.pytorch.org/whl/",
+        cuda_version: str = "cu124",
     ) -> DesiredState:
         """更新 desired-state 并自增 generation。"""
         with self._lock:
@@ -113,6 +119,8 @@ class EmbeddingServiceState:
                 model_id=model_id,
                 device=device,
                 enabled=enabled,
+                pytorch_mirror=pytorch_mirror,
+                cuda_version=cuda_version,
                 generation=self._desired.generation + 1,
                 updated_at=time.time(),
             )

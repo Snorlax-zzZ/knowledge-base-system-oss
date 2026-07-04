@@ -46,14 +46,14 @@ kb-mcp-proxy.py
 
 ### 3.2 两种模式的区别
 
-| | 直装版（主路线） | Docker 版（规划中，v1.x 计划） |
+| | 直装版（主路线） | Docker 版（代码保留，未交付编排 artefact） |
 |---|---|---|
 | API 地址 | `http://127.0.0.1:18000`（默认端口，可在 `/settings` 改） | `http://127.0.0.1:<API_PORT>`，端口由调用方在编排层指定 |
 | API 启动方式 | 菜单栏 / 托盘 App 启动；底层走 `scripts/kb-start.sh` 或 `local-restart-direct.ps1` | 由调用方自行编排 `python -m uvicorn app.main:app` 等 |
 | 代理配置 | 自动读 `config/config.toml` | 通过 `KB_PORT` 环境变量指定 API 端口 |
 | 前提条件 | 托盘图标显示运行中 | `curl /health` 返回 ok |
 
-> Docker 版在路线图上（v1.x 计划），当前先交付直装版主线。`repository_postgres.py` 与 `KB_BACKEND=postgres` 代码路径已实现，等 v1.x Docker 编排 artefact 一起释出。
+> 仓库内当前未提供 `Dockerfile` / `docker-compose.yml`。Docker 部署需调用方自行编排，但 `repository_postgres.py` 与 `KB_BACKEND=postgres` 代码路径保留。
 
 ### 3.3 暴露工具
 

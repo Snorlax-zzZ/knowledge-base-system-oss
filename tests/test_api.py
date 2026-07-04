@@ -402,7 +402,9 @@ def _mac_restart_setup(monkeypatch, tmp_path, *, scripts_exists: bool, mac_app_e
     monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "t.db"))
     monkeypatch.setenv("VECTOR_ENABLED", "0")
 
-    # restart_local_service 用 APP_DIR.parent 当 root_dir。
+    # restart_local_service 用 _resolve_data_root() 当 root_dir(优先 KB_APP_ROOT
+    # 环境变量,fallback 到 APP_DIR.parent)。之前 test 只 patch APP_DIR 未设
+    # KB_APP_ROOT,导致 fallback 到真项目根 → 拿到真 mac-app/restart.sh。
     fake_root = tmp_path / "root"
     (fake_root / "app").mkdir(parents=True)
     if scripts_exists:
@@ -413,6 +415,7 @@ def _mac_restart_setup(monkeypatch, tmp_path, *, scripts_exists: bool, mac_app_e
         (fake_root / "mac-app" / "restart.sh").write_text("#!/bin/sh\n")
 
     monkeypatch.setattr(main_mod, "APP_DIR", fake_root / "app")
+    monkeypatch.setenv("KB_APP_ROOT", str(fake_root))
 
     captured: dict = {}
 

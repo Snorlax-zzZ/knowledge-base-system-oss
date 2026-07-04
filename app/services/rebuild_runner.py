@@ -74,14 +74,19 @@ class RebuildState:
 
 
 def _default_backup_fn(qdrant_local_path: str, backup_root: str) -> Optional[str]:
-    """默认备份实现：复制整个 qdrant_local 目录到 backups/rebuild-{ts}/。"""
+    """默认备份实现：复制整个 qdrant_local 目录到 backups/rebuild-{ts}/。
+
+    跳过 ``.lock`` 文件：qdrant local 模式下 QdrantClient 独占持有 ``.lock``，
+    Windows 上 copytree 读它会撞 WinError 33（sharing violation）。``.lock``
+    是运行时锁不是数据，QdrantClient 冷启动会自动重建，backup 里没有它无害。
+    """
     src = Path(qdrant_local_path)
     if not src.exists():
         return None
     ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     dst = Path(backup_root) / f"rebuild-{ts}" / "qdrant_local"
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(src, dst)
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".lock"))
     return str(dst)
 
 

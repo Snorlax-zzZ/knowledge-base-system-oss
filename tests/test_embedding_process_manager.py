@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -45,6 +46,7 @@ from embedding_process_manager import (  # noqa: E402
     StopHandler,
     SubprocessSpawner,
     _PsCmdlineProbe,
+    _is_model_dir_complete,
 )
 
 
@@ -661,9 +663,9 @@ class TestInstallStatusWriter:
         path = tmp_path / "install_status.json"
         w = InstallStatusWriter(path)
         w.flush(phase="downloading", progress=-0.5)
-        assert json.loads(path.read_text())["progress"] == 0.0
+        assert json.loads(path.read_text(encoding="utf-8"))["progress"] == 0.0
         w.flush(phase="downloading", progress=2.0)
-        assert json.loads(path.read_text())["progress"] == 1.0
+        assert json.loads(path.read_text(encoding="utf-8"))["progress"] == 1.0
 
     def test_unknown_phase_rejected(self, tmp_path):
         w = InstallStatusWriter(tmp_path / "install_status.json")
@@ -677,20 +679,64 @@ class TestInstallStatusWriter:
 
 
 class _RecordingRunner(CommandRunner):
-    """脚本化 CommandRunner：按调用次序返回预设结果，并记录所有调用。"""
+    """脚本化 CommandRunner：按调用次序返回预设结果，并记录所有调用。
+
+    ``auto_stub_weights_on_success``：下载命令(cmd 含 snapshot_download)返 rc=0 时，
+    从 python -c script 里 grep 出 ``local_dir=`` 参数，在该目录写 config.json +
+    50MB+1 字节的 pytorch_model.bin，模拟真下载成功让 InstallExecutor post-check
+    _is_model_dir_complete 命中。silent-success 护栏测试要显式关掉这个 flag。
+    """
 
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], Path | None]] = []
         self.results: list[CommandResult] = []
+        self.auto_stub_weights_on_success = True
+        # _venv_deps_ready 探测的默认结果；None → 默认 rc=1（探测失败，走原 pip 路径）。
+        # 让老 happy path 断言不用感知 probe 步骤；新 skip 测试显式 override。
+        self.probe_default_result: Optional[CommandResult] = None
+        self.probe_calls: list[list[str]] = []
 
     def queue(self, returncode: int, stdout_tail: str = "") -> None:
         self.results.append(CommandResult(returncode=returncode, stdout_tail=stdout_tail))
 
     def run(self, cmd, *, cwd=None, log_path=None, env=None, timeout=None):  # type: ignore[override]
+        joined_args = " ".join(str(a) for a in cmd)
+        # _venv_deps_ready 探测（venv_python -c "import infinity_emb, torch, ..."）
+        # 走独立返回通道，不进 self.calls / self.results 消耗，保护老 happy path
+        # 三 queue（venv/pip/download）断言不变。
+        if "import infinity_emb, torch, huggingface_hub" in joined_args:
+            self.probe_calls.append(list(cmd))
+            if self.probe_default_result is not None:
+                return self.probe_default_result
+            return CommandResult(returncode=1, stdout_tail="probe default fail\n")
         self.calls.append((list(cmd), log_path))
         if not self.results:
             raise AssertionError(f"no canned result for {cmd}")
-        return self.results.pop(0)
+        result = self.results.pop(0)
+        if (
+            self.auto_stub_weights_on_success
+            and result.returncode == 0
+            and any("snapshot_download" in str(a) for a in cmd)
+        ):
+            self._stub_weights_from_cmd(cmd)
+        return result
+
+    @staticmethod
+    def _stub_weights_from_cmd(cmd) -> None:
+        script = " ".join(str(a) for a in cmd)
+        # cmd 里的 script 形如 ``...local_dir='C:/...',endpoint=...``
+        import re
+        m = re.search(r"local_dir=(['\"])(.+?)\1", script)
+        if not m:
+            return
+        local_dir = Path(m.group(2))
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "config.json").write_text("{}", encoding="utf-8")
+        weight = local_dir / "pytorch_model.bin"
+        min_bytes = 50 * 1024 * 1024 + 1024
+        with weight.open("wb") as f:
+            f.seek(min_bytes - 1)
+            f.write(b"\0")
 
 
 def _make_install_spec(tmp_path) -> InstallSpec:
@@ -740,7 +786,7 @@ class TestInstallExecutorHappyPath:
         assert "snapshot_download" in cmds[2][2]  # python -c "...snapshot_download..."
 
         # status 最终 = completed
-        body = json.loads(status_path.read_text())
+        body = json.loads(status_path.read_text(encoding="utf-8"))
         assert body["phase"] == "completed"
         assert body["progress"] == 1.0
 
@@ -783,7 +829,7 @@ class TestInstallExecutorFailures:
         executor, status_path = _make_executor(tmp_path, runner)
         assert executor.execute(_make_install_spec(tmp_path)) is False
 
-        body = json.loads(status_path.read_text())
+        body = json.loads(status_path.read_text(encoding="utf-8"))
         assert body["phase"] == "failed"
         assert "venv" in body["message"]
         assert "command not found" in body["error"]
@@ -796,7 +842,7 @@ class TestInstallExecutorFailures:
         runner.queue(1, stdout_tail="ERROR: No matching distribution\n")
         executor, status_path = _make_executor(tmp_path, runner)
         assert executor.execute(_make_install_spec(tmp_path)) is False
-        body = json.loads(status_path.read_text())
+        body = json.loads(status_path.read_text(encoding="utf-8"))
         assert body["phase"] == "failed"
         assert "pip install" in body["message"]
 
@@ -819,7 +865,7 @@ class TestInstallExecutorMirrorFallback:
         assert "hf-mirror.com" in download_cmds[0][2]
         assert "huggingface.co" in download_cmds[1][2]
         # 最终 completed
-        assert json.loads(status_path.read_text())["phase"] == "completed"
+        assert json.loads(status_path.read_text(encoding="utf-8"))["phase"] == "completed"
 
     def test_all_mirrors_fail_writes_failed(self, tmp_path):
         runner = _RecordingRunner()
@@ -829,9 +875,95 @@ class TestInstallExecutorMirrorFallback:
         runner.queue(1)  # mirror 2
         executor, status_path = _make_executor(tmp_path, runner)
         assert executor.execute(_make_install_spec(tmp_path)) is False
-        body = json.loads(status_path.read_text())
+        body = json.loads(status_path.read_text(encoding="utf-8"))
         assert body["phase"] == "failed"
         assert "镜像下载失败" in body["message"]
+
+    def test_rc0_but_weights_missing_treated_as_silent_success(self, tmp_path):
+        """护栏（2026-07-01 加）：huggingface_hub 撞 mirror 403 后会兜底 fallback
+        到 huggingface.co → 国内 timeout → 静默返回 local_dir 当作成功
+        (bytes_downloaded=0, returncode=0)。老大 v1.3.12 装机踩过这坑，
+        install phase=completed 但 infinity 启动撞 OSError(no pytorch_model.bin)。
+
+        修复：rc=0 但权重缺失 → 视为 silent-success → 走下一个 mirror。
+        """
+        runner = _RecordingRunner()
+        runner.auto_stub_weights_on_success = False  # 关掉 auto stub 模拟 silent-success
+        runner.queue(0)  # venv
+        runner.queue(0)  # pip
+        runner.queue(0)  # mirror 1 - rc=0 但没建权重（silent-success）
+        runner.queue(1)  # mirror 2 - 真失败
+        executor, status_path = _make_executor(tmp_path, runner)
+        assert executor.execute(_make_install_spec(tmp_path)) is False
+        # 两个 mirror 都被访问（silent-success 也算失败继续 fallback）
+        download_cmds = [c[0] for c in runner.calls[2:]]
+        assert len(download_cmds) == 2
+        body = json.loads(status_path.read_text(encoding="utf-8"))
+        assert body["phase"] == "failed"
+        # error 提示这是 silent fallback，方便运维定位
+        assert "silent-fallback" in body["error"] or "silent" in body["error"].lower()
+
+    def test_pip_skipped_when_venv_deps_ready(self, tmp_path):
+        """2026-07-01 加：venv 里 infinity_emb+torch+huggingface_hub 都 import
+        得动时 → _pip_install 直接 return，不再跑 pip_install_cmd。
+        触发场景：installer 选保留覆盖装（venv 保留）、跨机拷贝 venv。
+        """
+        from embedding_process_manager import CommandResult
+        runner = _RecordingRunner()
+        runner.queue(0)  # venv
+        # 不 queue pip（应该被 skip）
+        runner.queue(0)  # download
+        runner.probe_default_result = CommandResult(returncode=0, stdout_tail="")
+
+        executor, status_path = _make_executor(tmp_path, runner)
+        assert executor.execute(_make_install_spec(tmp_path)) is True
+
+        # 只有 2 个非探测 call：venv、download。pip 被 skip 了
+        cmds = [c[0] for c in runner.calls]
+        assert len(cmds) == 2
+        assert cmds[0][1] == "-m" and cmds[0][2] == "venv"
+        assert "snapshot_download" in cmds[1][2]
+        # 探测确实跑过（走独立通道 probe_calls）
+        assert len(runner.probe_calls) == 1
+        assert "import infinity_emb" in " ".join(str(a) for a in runner.probe_calls[0])
+        # phase 序列跳过 pip_installing 是 acceptable（走 downloading 消息）
+        body = json.loads(status_path.read_text(encoding="utf-8"))
+        assert body["phase"] == "completed"
+
+    def test_pip_runs_when_venv_probe_fails(self, tmp_path):
+        """探测 rc!=0（venv 缺 infinity_emb / 装了但破了）时必须走原 pip 路径。
+        防 skip 逻辑被过度触发导致漏装。
+        """
+        from embedding_process_manager import CommandResult
+        runner = _RecordingRunner()
+        runner.queue(0)  # venv
+        runner.queue(0)  # pip
+        runner.queue(0)  # download
+        # probe 默认 fail（rc=1）→ 走原 pip 路径
+
+        executor, _ = _make_executor(tmp_path, runner)
+        assert executor.execute(_make_install_spec(tmp_path)) is True
+        cmds = [c[0] for c in runner.calls]
+        assert len(cmds) == 3  # venv + pip + download
+        assert "pip" in cmds[1][0] or "pip" in " ".join(str(a) for a in cmds[1])
+        # probe 也跑了但 fail
+        assert len(runner.probe_calls) == 1
+
+    def test_download_cmd_includes_ignore_patterns(self, tmp_path):
+        """hf-mirror 对 imgs/.DS_Store 等文件返 403，snapshot_download 必须
+        带 ignore_patterns 跳过；不带就会撞 403 → 静默 fallback → silent-success。
+        """
+        runner = _RecordingRunner()
+        runner.queue(0)  # venv
+        runner.queue(0)  # pip
+        runner.queue(0)  # download
+        executor, _ = _make_executor(tmp_path, runner)
+        executor.execute(_make_install_spec(tmp_path))
+        download_script = runner.calls[2][0][2]  # python -c "<script>"
+        assert "ignore_patterns" in download_script
+        # 必须涵盖已知踩坑三项
+        for pat in ("imgs/*", ".DS_Store", ".gitattributes"):
+            assert pat in download_script, f"missing ignore pattern: {pat}"
 
 
 # ---------------------------------------------------------------------------
@@ -863,11 +995,13 @@ class _FakeHandle(ProcessHandle):
 class _RecordingSpawner(SubprocessSpawner):
     def __init__(self) -> None:
         self.calls: list[tuple[list, Path | None]] = []
+        self.env_calls: list[dict[str, str] | None] = []
         self.next_handle: ProcessHandle | None = _FakeHandle(pid=12345)
         self.raise_exc: Exception | None = None
 
     def spawn(self, cmd, *, cwd=None, env=None, log_path=None):  # type: ignore[override]
         self.calls.append((list(cmd), log_path))
+        self.env_calls.append(dict(env) if env else None)
         if self.raise_exc:
             raise self.raise_exc
         h = self.next_handle
@@ -923,8 +1057,8 @@ class TestStartHandlerSpawn:
 
         handle, ready, err = handler.spawn_and_wait_ready(spec)
         assert handle is not None and ready is True and err == ""
-        assert (spec.runtime_dir / "pid").read_text() == "12345"
-        assert (spec.runtime_dir / "port").read_text() == "7687"
+        assert (spec.runtime_dir / "pid").read_text(encoding="utf-8") == "12345"
+        assert (spec.runtime_dir / "port").read_text(encoding="utf-8") == "7687"
 
     def test_spawn_exception_returns_error(self, tmp_path):
         spawner = _RecordingSpawner()
@@ -942,6 +1076,31 @@ class TestStartHandlerSpawn:
         handler.spawn_and_wait_ready(spec)
         _cmd, log_path = spawner.calls[0]
         assert log_path == spec.infinity_log_path
+
+    def test_passes_env_to_spawner(self, tmp_path):
+        """plan.env 必须透传到 spawn 子进程；否则 infinity 启动撞
+        NameError(BetterTransformerManager) → exit 3（v1.3.13 修复）。"""
+        spawner = _RecordingSpawner()
+        handler = _make_handler(_ScriptedProbe([True]), spawner=spawner)
+        runtime_dir = tmp_path / "runtime"
+        spec = StartSpec(
+            model_id="bge-m3",
+            device="cpu",
+            start_cmd=["infinity_emb", "v2", "--port", "7687"],
+            port=7687,
+            runtime_dir=runtime_dir,
+            infinity_log_path=tmp_path / "logs" / "infinity.log",
+            env={"INFINITY_BETTERTRANSFORMER": "false"},
+        )
+        handler.spawn_and_wait_ready(spec)
+        assert spawner.env_calls[0] == {"INFINITY_BETTERTRANSFORMER": "false"}
+
+    def test_empty_env_passed_as_none(self, tmp_path):
+        """spec.env 空时 spawn 收到 env=None（不强制传空 dict 污染 os.environ 合并）。"""
+        spawner = _RecordingSpawner()
+        handler = _make_handler(_ScriptedProbe([True]), spawner=spawner)
+        handler.spawn_and_wait_ready(_make_start_spec(tmp_path))
+        assert spawner.env_calls[0] is None
 
 
 class TestStartHandlerHealth:
@@ -1533,8 +1692,8 @@ class TestEndToEndWithFakeInfinity:
             assert ready is True, f"探活超时: {err}"
             assert handle.poll() is None
             # runtime 文件落盘
-            assert (runtime_dir / "pid").read_text() == str(handle.pid)
-            assert (runtime_dir / "port").read_text() == str(port)
+            assert (runtime_dir / "pid").read_text(encoding="utf-8") == str(handle.pid)
+            assert (runtime_dir / "port").read_text(encoding="utf-8") == str(port)
 
             # 跑一遍 stop（验证 SIGTERM normal 正常收尾）
             stopper = StopHandler(grace_sec=3.0, poll_interval_sec=0.2)
@@ -1550,6 +1709,10 @@ class TestEndToEndWithFakeInfinity:
                 except Exception:
                     pass
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows TerminateProcess 无法被进程忽略，fake_infinity --sigterm-mode ignore 在 Win 上无意义；强杀路径走 test_force_kill 的 taskkill 路径覆盖",
+    )
     def test_stop_force_kills_when_sigterm_ignored(self, tmp_path):
         """AC14a 端到端：fake_infinity --sigterm-mode ignore → 3s 内被 SIGKILL。"""
         import socket
@@ -1593,3 +1756,54 @@ class TestEndToEndWithFakeInfinity:
         assert handle.poll() is not None, "kill 应让进程退出"
         # AC14a：必须在 grace+宽限 (~3s) 内强杀完
         assert elapsed < 4.0, f"强杀耗时过长: {elapsed:.2f}s"
+
+
+class TestIsModelDirComplete:
+    """``_is_model_dir_complete`` 必须只认 PyTorch 权重，不认 ONNX。
+
+    原因：infinity 启动模板默认 ``engine=torch``，必须 pytorch_model.bin /
+    model.safetensors。若误把 onnx/model.onnx_data 当完整，会跳过 snapshot_download
+    后 infinity 启动撞 ``OSError: no file named pytorch_model.bin, model.safetensors,
+    ...`` → exit code 3。
+    """
+
+    MIN_BYTES = 50 * 1024 * 1024 + 1024  # 略大于 50MB 阈值
+
+    @staticmethod
+    def _touch(p: Path, size: int = 0) -> None:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("wb") as f:
+            if size > 0:
+                f.seek(size - 1)
+                f.write(b"\0")
+
+    def test_empty_local_dir_returns_false(self):
+        assert _is_model_dir_complete("") is False
+
+    def test_missing_config_returns_false(self, tmp_path):
+        self._touch(tmp_path / "model.safetensors", self.MIN_BYTES)
+        assert _is_model_dir_complete(str(tmp_path)) is False
+
+    def test_only_onnx_weights_returns_false(self, tmp_path):
+        """老大本机踩到的坑：onnx_data 在但 PyTorch 权重缺，必须返 False
+        才能触发 snapshot_download 补 pytorch 权重。"""
+        self._touch(tmp_path / "config.json")
+        self._touch(tmp_path / "onnx" / "model.onnx_data", self.MIN_BYTES)
+        self._touch(tmp_path / "onnx" / "model.onnx", self.MIN_BYTES)
+        assert _is_model_dir_complete(str(tmp_path)) is False
+
+    def test_pytorch_bin_returns_true(self, tmp_path):
+        self._touch(tmp_path / "config.json")
+        self._touch(tmp_path / "pytorch_model.bin", self.MIN_BYTES)
+        assert _is_model_dir_complete(str(tmp_path)) is True
+
+    def test_safetensors_returns_true(self, tmp_path):
+        self._touch(tmp_path / "config.json")
+        self._touch(tmp_path / "model.safetensors", self.MIN_BYTES)
+        assert _is_model_dir_complete(str(tmp_path)) is True
+
+    def test_undersized_weight_returns_false(self, tmp_path):
+        """只有元数据壳（<50MB）不算完整。"""
+        self._touch(tmp_path / "config.json")
+        self._touch(tmp_path / "pytorch_model.bin", 1024)  # 1KB
+        assert _is_model_dir_complete(str(tmp_path)) is False

@@ -252,14 +252,27 @@ def client(tmp_path, monkeypatch):
     return TestClient(app)
 
 
-def test_put_system_config_invalidates_repo_singleton(client):
-    """改完 /settings 必须让 repo 单例失效，下次 get_repo 拿新 VectorIndex。"""
+def test_put_system_config_live_reloads_vector_index(client):
+    """改完 /settings 必须让 vector_index 立即读到新配置。
+
+    2026-07-01 方案 E：契约从"clear + pause 单例池"改成"live reload
+    原地热刷新"——保持 QdrantClient(path=...) 单实例语义、绕开 portalocker
+    AlreadyLocked 竞态。断言：
+    - 单例池 **不清空**（老契约要求清空，本 PR 反转）
+    - vi 对象身份不变（同一个 id）
+    - vi.embedding 已按新 config 更新
+    """
     from app.main import _repo_singletons
+    from app.vector_index import HashEmbedding
 
     # 先触发一次 GET 让单例池命中
     resp = client.get("/v1/system/config")
     assert resp.status_code == 200
     assert len(_repo_singletons) == 1
+
+    repo_before = next(iter(_repo_singletons.values()))
+    vi_before = repo_before.vector_index
+    vi_id_before = id(vi_before)
 
     # PUT 改配置：必填 api_base_url + grafana_url（min_length=1），其余字段用默认。
     put_resp = client.put("/v1/system/config", json={
@@ -271,5 +284,10 @@ def test_put_system_config_invalidates_repo_singleton(client):
     })
     assert put_resp.status_code == 200, put_resp.text
 
-    # 关键断言：单例池已被清空，下次 get_repo 会重建
-    assert len(_repo_singletons) == 0
+    # 新契约：单例池保留，vi 对象身份不变
+    assert len(_repo_singletons) == 1, "live reload 契约禁止清空单例池"
+    repo_after = next(iter(_repo_singletons.values()))
+    assert repo_after is repo_before, "repo 对象跨 PUT 稳定"
+    assert id(repo_after.vector_index) == vi_id_before, "vector_index 对象跨 PUT 稳定"
+    # embedding_enabled=False → 退回 HashEmbedding
+    assert isinstance(repo_after.vector_index.embedding, HashEmbedding)

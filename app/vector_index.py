@@ -94,6 +94,53 @@ def _apply_db_embedding_to_env(db_cfg: dict) -> int | None:
     return None
 
 
+@dataclass(frozen=True)
+class _ResolvedRuntime:
+    """派生自 DB config + env 的 embedding runtime 快照。
+
+    只覆盖 VectorIndex 生命周期中允许原地热刷新的字段（enabled / embedding /
+    fallback / dim）；qdrant_url / qdrant_local_path / collection_name 属于
+    进程级绑定，不在热刷新范围内——这些改了必须重建 client（现阶段不支持）。
+    """
+
+    enabled: bool
+    embedding: "EmbeddingProvider"
+    fallback: "EmbeddingProvider"
+    dim: int
+
+
+def _resolve_runtime_from_db_cfg(
+    db_cfg: dict | None, *, default_dim: int
+) -> _ResolvedRuntime:
+    """从 DB config + env 派生 embedding runtime；供 __init__ / from_env / reload 复用。
+
+    副作用：写 os.environ（复用 _apply_db_embedding_to_env 的 env 桥接机制）。
+    幂等：相同 db_cfg 多次调用结果一致；db_cfg 为空 / 未激活时回退纯 env 读取。
+    """
+    dim = default_dim
+    if db_cfg:
+        mode = str(db_cfg.get("embedding_service_mode") or "disabled").lower()
+        local_ready = mode == "local" and bool(db_cfg.get("embedding_service_model_id"))
+        remote_ready = bool(
+            db_cfg.get("embedding_enabled") and db_cfg.get("embedding_model")
+        )
+        if local_ready or remote_ready:
+            db_dim = _apply_db_embedding_to_env(db_cfg)
+            if db_dim is not None:
+                dim = db_dim
+
+    enabled = os.getenv("VECTOR_ENABLED", "1") not in ("0", "false", "False")
+    emb_cfg = embedding_config_from_env(default_dim=dim)
+    if emb_cfg.active:
+        embedding: EmbeddingProvider = ApiEmbedding(emb_cfg)
+        fallback: EmbeddingProvider = HashEmbedding(dim=emb_cfg.dim)
+        dim = emb_cfg.dim
+    else:
+        embedding = HashEmbedding(dim=dim)
+        fallback = HashEmbedding(dim=dim)
+    return _ResolvedRuntime(enabled=enabled, embedding=embedding, fallback=fallback, dim=dim)
+
+
 class HashEmbedding:
     def __init__(self, dim: int = 384) -> None:
         self.dim = dim
@@ -191,6 +238,14 @@ class VectorIndex:
         # 下一次 _ensure 重建。pause/resume 在 maintenance 流程串行调用。
         self._paused = False
         self._lock = threading.RLock()
+        # reload_from_repo 检测到 dim 变化时 True；_ensure_client_and_collection 会重
+        # 检 collection size 决定是否 recreate。默认 False 让 upsert/search 热路径直接
+        # 走 client is not None 的 fast return。
+        self._schema_refresh_needed = False
+        # 记录 _ensure_client_and_collection 最近一次失败（如 QdrantClient(path=)
+        # 撞 stale lock、recreate_collection 抛 io 错误等），供诊断端点回读。仅调试
+        # 用，非稳态属性——成功建 client 后清空。
+        self._last_init_error: str | None = None
 
         emb_cfg = embedding_config_from_env(default_dim=dim)
         if emb_cfg.active:
@@ -260,8 +315,10 @@ class VectorIndex:
     def pause(self) -> None:
         """暂停向量索引：close 当前 client，禁止懒重连（审计 #6）。
 
-        backup import 期间调用：set paused → close client → 期间 search/ask
-        会发现 _client is None 且 _ensure 因 paused 不重连，自动降级为关键词检索。
+        **只给 maintenance 用**（backup import / recover / 独占重建索引这类需要"关文件
+        句柄再重开"的窗口），**禁止** 塞进 config hot reload 路径——原地热刷新走
+        ``reload_from_repo``。以前 ``_invalidate_repo_singletons`` 里 clear + pause
+        导致的 portalocker AlreadyLocked 竞态就是这个约束被违反造成的，别再犯（方案 E）。
         """
         with self._lock:
             self._paused = True
@@ -274,31 +331,90 @@ class VectorIndex:
                 logger.warning("vector_index.pause: qdrant client close failed", exc_info=True)
 
     def resume(self) -> None:
-        """恢复向量索引：clear paused，下一次 search 调用 _ensure 重建 client。"""
+        """恢复向量索引：clear paused + 主动 eager reinit client。
+
+        **只给 maintenance 用**——同 ``pause`` 的约束。config hot reload 不要走这里。
+
+        2026-07-03 P0 修：resume 后主动 ``_ensure_client_and_collection()``，
+        保证 client 立即就位。之前只 clear paused + _client=None，依赖下一次
+        search/write 触发 lazy _ensure，撞非 search 路径（如 rebuild-vector-index
+        `scripts/rebuild_vector_index.py:84` 直接读 ``vector_index._client`` 属性
+        不 trigger lazy init）读到 None → "Qdrant 客户端不可用，无法重建"。
+        实测 X2.5 clear+import roundtrip 后立刻 rebuild 100% 复现。
+        eager _ensure 失败不 raise（保持向后兼容 lazy 语义）：只 warn，下一次
+        search 仍会重试触发。
+        """
         with self._lock:
             self._paused = False
             self._client = None  # 强制 _ensure 重建
+        try:
+            self._ensure_client_and_collection()
+        except Exception:
+            logger.warning(
+                "vector_index.resume: eager _ensure_client_and_collection failed, "
+                "will retry on next search/write call", exc_info=True,
+            )
+
+    def reload_from_repo(self, repo: Any, *, allow_schema_refresh: bool) -> None:
+        """原地热刷新 embedding runtime，**不 close 也不重建** QdrantClient。
+
+        - config hot reload 路径唯一入口（``_refresh_live_repo_vector_indexes`` 里调）。
+        - 保持进程内 QdrantClient(path=...) 单实例持有者语义，从根上杜绝 portalocker
+          AlreadyLocked 竞态。
+        - ``allow_schema_refresh=True``：dim 变了就 mark schema refresh，随后
+          ``_ensure_client_and_collection`` 重检 collection size 并 recreate。
+        - ``allow_schema_refresh=False``：dim 变了也不动 collection——留给用户显式 rebuild
+          路径决定（如 mode / model_id 切换必须走 confirm_reindex）。
+        """
+        try:
+            db_cfg = repo.get_system_config() or {}
+        except Exception:
+            logger.warning("reload_from_repo 读 DB config 失败，跳过热刷新", exc_info=True)
+            return
+        resolved = _resolve_runtime_from_db_cfg(db_cfg, default_dim=int(self.embedding.dim))
+        with self._lock:
+            old_dim = int(self.embedding.dim)
+            self.enabled = resolved.enabled
+            self.embedding = resolved.embedding
+            self._fallback_embedding = resolved.fallback
+            if allow_schema_refresh and old_dim != int(resolved.embedding.dim):
+                self._schema_refresh_needed = True
+        if allow_schema_refresh and self.enabled:
+            # client 已在时 _ensure 走"复用 client + 重检 collection"分支
+            self._ensure_client_and_collection()
 
     def _ensure_client_and_collection(self) -> None:
+        # 快照决策：paused 直接不动；client 已在且无 schema refresh 请求 fast return。
+        # client 已在但 _schema_refresh_needed=True 时（reload_from_repo dim 变），进入
+        # 下面的"复用 client + 重检 collection size"分支，不 close 也不重建 client。
         with self._lock:
             if self._paused:
                 return
-            if self._client is not None:
+            need_schema_check = self._schema_refresh_needed
+            if self._client is not None and not need_schema_check:
                 return
+
         try:
             from qdrant_client import QdrantClient, models
-        except Exception:
+        except Exception as _imp_exc:
+            import traceback as _tb
             logger.warning("qdrant_client 导入失败，向量检索禁用", exc_info=True)
             self.enabled = False
+            with self._lock:
+                self._last_init_error = (
+                    f"qdrant_client import failed: {type(_imp_exc).__name__}: {_imp_exc}\n"
+                    + _tb.format_exc()
+                )
             return
 
         try:
-            if self.qdrant_local_path is not None:
-                import os as _os
-                _os.makedirs(self.qdrant_local_path, exist_ok=True)
-                self._client = QdrantClient(path=self.qdrant_local_path)
-            else:
-                self._client = QdrantClient(url=self.qdrant_url)
+            if self._client is None:
+                if self.qdrant_local_path is not None:
+                    import os as _os
+                    _os.makedirs(self.qdrant_local_path, exist_ok=True)
+                    self._client = QdrantClient(path=self.qdrant_local_path)
+                else:
+                    self._client = QdrantClient(url=self.qdrant_url)
             collections = self._client.get_collections().collections
             exists = any(c.name == self.collection_name for c in collections)
             if not exists:
@@ -318,10 +434,20 @@ class VectorIndex:
                             distance=models.Distance.COSINE,
                         ),
                     )
-        except Exception:
+            # schema 校验完成，清标志（下次 upsert/search 走 fast return）
+            with self._lock:
+                self._schema_refresh_needed = False
+                self._last_init_error = None
+        except Exception as _init_exc:
+            import traceback as _tb
             logger.warning("Qdrant 连接/初始化失败 url=%s，降级为关键词检索", self.qdrant_url, exc_info=True)
             self._client = None
             self.enabled = False
+            with self._lock:
+                self._last_init_error = (
+                    f"{type(_init_exc).__name__}: {_init_exc}\n"
+                    + _tb.format_exc()
+                )
 
     def _embed_with_fallback(self, text: str) -> list[float]:
         try:
@@ -337,10 +463,15 @@ class VectorIndex:
             return self.embedding.embed(text)
 
     def upsert_chunks(self, chunks: list[dict[str, Any]], *, max_retries: int = 3) -> None:
-        if not self.enabled or not chunks:
+        # 半刷新防御：锁内抓 enabled 快照，避免读到 reload 中途的半状态
+        with self._lock:
+            enabled = self.enabled
+        if not enabled or not chunks:
             return
         self._ensure_client_and_collection()
-        if self._client is None:
+        with self._lock:
+            client = self._client
+        if client is None:
             logger.warning("Qdrant 客户端不可用，跳过向量写入 chunk_count=%d", len(chunks))
             return
 
@@ -362,7 +493,7 @@ class VectorIndex:
         # 有限重试：短时网络抖动可自愈
         for attempt in range(1, max_retries + 1):
             try:
-                self._client.upsert(collection_name=self.collection_name, points=points)
+                client.upsert(collection_name=self.collection_name, points=points)
                 if attempt > 1:
                     logger.info("向量写入重试成功 attempt=%d/%d", attempt, max_retries)
                 return
@@ -386,7 +517,11 @@ class VectorIndex:
 
         exclude_chunk_ids: 新写入的 chunk id 列表，排除在外以免误删当前版本向量。
         """
-        if not self.enabled or self._client is None:
+        # 半刷新防御：锁内抓 enabled + client 快照
+        with self._lock:
+            enabled = self.enabled
+            client = self._client
+        if not enabled or client is None:
             return
         try:
             from qdrant_client import models
@@ -403,7 +538,7 @@ class VectorIndex:
                 )
             else:
                 filter_ = models.Filter(must=must)
-            self._client.delete(
+            client.delete(
                 collection_name=self.collection_name,
                 points_selector=models.FilterSelector(filter=filter_),
             )
@@ -412,10 +547,15 @@ class VectorIndex:
             logger.warning("清理旧版本向量失败 item_id=%s", knowledge_item_id, exc_info=True)
 
     def search(self, *, query: str, domain: str, project: str | None, top_k: int) -> list[VectorSearchHit]:
-        if not self.enabled:
+        # 半刷新防御：锁内抓 enabled 快照
+        with self._lock:
+            enabled = self.enabled
+        if not enabled:
             return []
         self._ensure_client_and_collection()
-        if self._client is None:
+        with self._lock:
+            client = self._client
+        if client is None:
             return []
 
         from qdrant_client import models
@@ -426,7 +566,7 @@ class VectorIndex:
 
         query_vector = self._embed_with_fallback(query)
         # qdrant-client 新版本移除了 search()，统一使用 query_points()
-        response = self._client.query_points(
+        response = client.query_points(
             collection_name=self.collection_name,
             query=query_vector,
             query_filter=models.Filter(must=must),

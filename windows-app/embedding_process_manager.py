@@ -56,6 +56,10 @@ class DesiredStateSnapshot:
     model_id: str = ""
     device: str = "cpu"
     enabled: bool = False
+    # v1.3.12：cuda wheel 安装配置（device=cuda 时透传给 build_install_plan）。
+    # 老版 kb-api 不返这两个字段 → get_desired 取默认（阿里 + cu121）。
+    pytorch_mirror: str = "https://download.pytorch.org/whl/"
+    cuda_version: str = "cu124"
     generation: int = 0
     updated_at: float = 0.0
 
@@ -254,9 +258,13 @@ class KbApiClient:
         except Exception as exc:  # noqa: BLE001 — 把任何底层错统一抽象成 transport 错
             raise KbApiTransportError(f"transport failure: {exc}") from exc
 
-        if status == 401:
+        if status in (401, 403):
+            # 兼容 kb-api owner_token mismatch 返 403 的情况（app/main.py:878/1020）：
+            # kb-api 单独重启后 token 会换，壳层缓存的旧 token 命中 403，必须 invalidate 触发下次重读。
+            # 401 是"未认证"（缓存 token 缺失），403 是"认证过但 token 不对"（缓存脏了），
+            # 两个 case 对壳层来说处理方式一致：清缓存 + 抛异常让 caller retry。
             self._token.invalidate()
-            raise KbApiUnauthorized(f"{method} {path} -> 401")
+            raise KbApiUnauthorized(f"{method} {path} -> {status}")
         if status == 409:
             raise KbApiConflict(f"{method} {path} -> 409 {raw.decode('utf-8', errors='replace')}")
         if status >= 500 or status < 200:
@@ -281,6 +289,10 @@ class KbApiClient:
             model_id=body.get("model_id", ""),
             device=body.get("device", "cpu"),
             enabled=bool(body.get("enabled", False)),
+            pytorch_mirror=body.get(
+                "pytorch_mirror", "https://download.pytorch.org/whl/"
+            ),
+            cuda_version=body.get("cuda_version", "cu124"),
             generation=int(body.get("generation", 0)),
             updated_at=float(body.get("updated_at", 0.0)),
         )
@@ -327,6 +339,26 @@ class ActionHandler:
         self, desired: DesiredStateSnapshot, current: ActualStateSnapshot,
     ) -> ActualStateSnapshot:
         raise NotImplementedError("switch_model handler 未实现（Batch E）")
+
+    def self_heal_warmup_if_needed(
+        self, actual: ActualStateSnapshot,
+    ) -> Optional[ActualStateSnapshot]:
+        """bug 2 自愈钩子（默认 no-op，让 EmbeddingActionHandler 覆盖）。
+
+        约定：返回 ``None`` 表示无需自愈；返回新 ``ActualStateSnapshot`` 则
+        manager 锁内替换当前 actual 并照常回写 kb-api。
+        """
+        return None
+
+    def shutdown(self) -> None:
+        """tray quit 时的强制清理钩子（默认 no-op，EmbeddingActionHandler 覆盖）。
+
+        约定：发 SIGTERM → grace → SIGKILL 给当前 infinity handle + 清
+        runtime/pid|port，避免 tray 退出后 infinity 成孤儿（kb-tray taskkill
+        kb-api 进程树不带 infinity—— infinity 是 kb-tray 平级 spawn 的，不在
+        kb-api 树里）。``manager.stop()`` 起手调用。
+        """
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -406,8 +438,17 @@ class EmbeddingProcessManager:
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
-        """通知 reconcile loop 退出；等线程 join。"""
+        """通知 reconcile loop 退出；等线程 join。
+
+        顺带调 ``handler.shutdown()`` 强制带走 infinity 子进程，避免 tray quit
+        后 orphan（对齐 Mac Swift ``EmbeddingProcessManager.stop:781`` 的
+        "顺带关掉 infinity 子进程" 注释逻辑）。失败吞掉日志，不阻塞退出。
+        """
         self._stop_event.set()
+        try:
+            self._handler.shutdown()
+        except Exception:  # noqa: BLE001
+            logger.warning("manager.stop: handler.shutdown failed", exc_info=True)
         if self._thread is not None:
             self._thread.join(timeout=timeout)
 
@@ -432,6 +473,15 @@ class EmbeddingProcessManager:
 
         切分到独立方法便于单测直接驱动单 tick，不必跑整个 loop。
         """
+        # bug 2 自愈（与 Mac Swift ``selfHealWarmupIfNeeded`` 同步）：
+        # StartHandler 在 warmup 超时时返回 (handle, ready=false, "warmup
+        # timeout")，actual.warming_up 会卡 true。但 infinity 实际可能在超时
+        # 后才完成 model load——此时进程仍在跑、/health 真返 200，只是 actual
+        # 状态没人重置。shouldSkip 又会因 generation 没涨直接跳过 dispatch，
+        # 永远不会进 doStart 重写 actual。每 tick 起手让 handler 自检：handle
+        # 仍活 + /health 200 + actual 仍脏 → 立即清状态并回写一次。
+        self._self_heal_warmup()
+
         try:
             desired = self._client.get_desired()
             self._backoff = 0.0
@@ -455,6 +505,39 @@ class EmbeddingProcessManager:
         # 标记 done（即使 dispatch 内部失败也要标记，避免死循环重试无效 action）
         self._last_done_generation = desired.generation
         self._write_actual(desired)
+
+    def _self_heal_warmup(self) -> None:
+        """委托 handler 检查是否需要清 warmup 脏态；脏 → 锁内替换并立即回写。
+
+        独立成方法是为了：(a) 把 handler 拒绝自愈（返回 None）的快路径放循环
+        热区；(b) 异常吞掉，handler 实现里 raise 不能挂掉主 loop。
+        """
+        with self._actual_lock:
+            snap = ActualStateSnapshot(**asdict(self._actual))
+        try:
+            healed = self._handler.self_heal_warmup_if_needed(snap)
+        except Exception:  # noqa: BLE001
+            logger.exception("self_heal_warmup_if_needed crashed; ignoring")
+            return
+        if healed is None:
+            return
+        with self._actual_lock:
+            # 二次校验：另一个 tick 可能已经改了 warming_up，避免覆盖正确值
+            if self._actual.warming_up or "warmup timeout" in self._actual.last_error:
+                self._actual = healed
+                logger.info(
+                    "selfHeal: warmup state cleared (pid=%s port=%s)",
+                    healed.pid, healed.port,
+                )
+                # 立即心跳一次，让 kb-api 第一时间看到状态翻绿。带 acknowledged
+                # generation = handler 持有 → 用 actual 自身已有的 ack 值即可。
+                try:
+                    self._client.post_actual(healed)
+                    self._last_heartbeat_at = self._clock()
+                except (KbApiUnauthorized, KbApiConflict):
+                    pass
+                except KbApiTransportError as e:
+                    self._on_error(f"self_heal post_actual transport error: {e}")
 
     def _should_skip(self, desired: DesiredStateSnapshot) -> bool:
         """是否跳过执行：generation 已 done + action=none 时仅心跳。"""
@@ -665,25 +748,52 @@ class DefaultCommandRunner(CommandRunner):
             bufsize=1,
             creationflags=creationflags,
         )
-        tail_lines: list[str] = []
+        # 2026-07-02 P2-1 fix: 原逻辑 `for line in proc.stdout` 阻塞读到 EOF 才
+        # 走到 proc.wait(timeout=), timeout 完全不生效(子进程 hang 时主线程永
+        # 远卡在 stdout 迭代)。改成后台线程读 stdout, 主线程 wait(timeout=),
+        # 超时先 terminate → 3s 再 kill, 兜底防 install probe hang 死锁 reconcile。
+        # 用 deque(maxlen=50) 替代 list + append/pop, 线程安全。
+        from collections import deque
+        tail_dq: deque = deque(maxlen=50)
         log_handle = None
         if log_path is not None:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_handle = log_path.open("a", encoding="utf-8")
+
+        def _reader() -> None:
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    if log_handle is not None:
+                        try:
+                            log_handle.write(line)
+                            log_handle.flush()
+                        except Exception:
+                            pass
+                    tail_dq.append(line)
+            except Exception:
+                pass
+
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+        timed_out = False
         try:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                if log_handle is not None:
-                    log_handle.write(line)
-                    log_handle.flush()
-                tail_lines.append(line)
-                if len(tail_lines) > 50:
-                    tail_lines.pop(0)
             rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            proc.terminate()
+            try:
+                rc = proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                rc = proc.wait()
         finally:
+            reader_thread.join(timeout=2.0)
             if log_handle is not None:
                 log_handle.close()
-        return CommandResult(returncode=rc, stdout_tail="".join(tail_lines))
+        if timed_out:
+            tail_dq.append(f"\n[timeout {timeout}s: process terminated]\n")
+        return CommandResult(returncode=rc, stdout_tail="".join(tail_dq))
 
 
 # ---------------------------------------------------------------------------
@@ -778,6 +888,29 @@ class InstallExecutor:
         )
 
     def _pip_install(self, spec: InstallSpec) -> None:
+        # 2026-07-01 加短路：venv 已可用（infinity_emb + torch + huggingface_hub
+        # 都 import 得动）时 skip 整个 pip 步骤。触发场景：
+        # - installer 选"保留"覆盖装（venv 保留），Inno 只清 bin/ 下 exe
+        # - 跨机拷贝 venv、多份 installer 重复装同版本
+        # 平级于 _download_model 里的 _is_model_dir_complete skip；老逻辑漏了这
+        # 一步 → 保留 venv 场景 pip resolver 空跑十几分钟（numpy 反复降级、torch
+        # cu124 index-url resolver 检查 4.4G wheel 依赖）—— 2026-07-01
+        # audit 之后老大要求补齐。
+        if self._venv_deps_ready(spec):
+            logger.info(
+                "venv deps already importable; skipping pip install (venv=%s)",
+                spec.venv_dir,
+            )
+            self._status.flush(
+                phase="downloading", progress=0.35,
+                message="检测到 venv 依赖已就绪，跳过 pip 安装",
+            )
+            return
+
+        # spec.pip_install_cmd 是 build_install_plan 出的单条 venv_python -c
+        # "<script>" 命令；script 内部 subprocess.call 串两步 pip（先装 infinity-emb
+        # 全套，后 force-upgrade numpy>=2.1 + click<8.2 兼容 Python 3.13）。详见
+        # app/services/embedding_install.py:build_install_plan 注释。
         result = self._runner.run(spec.pip_install_cmd, log_path=self._pip_log_path)
         if result.returncode != 0:
             raise _InstallStepFailed(
@@ -785,13 +918,87 @@ class InstallExecutor:
                 message="pip install infinity-emb 失败",
                 error=_tail(result.stdout_tail, result.stderr_tail),
             )
+
         self._status.flush(
             phase="downloading", progress=0.35,
             message="开始下载模型",
         )
 
+    def _venv_deps_ready(self, spec: InstallSpec) -> bool:
+        """强 probe：探 5 个 import + click / numpy 版本校验，识别"Step1 装成
+        Step2 失败"的半装 venv（2026-07-02 P0 flag）。
+
+        返 True → pip 步骤 skip；False → 走正常 pip 路径。任何异常（venv 不存
+        在 / probe 超时 / import 报错）都返 False 走 pip 兜底，不影响正确性。
+
+        exit code 分级（便于日志诊断）：
+          0 = 全过（venv 完整可跑 infinity），skip pip
+          1 = 关键 import 失败（infinity_emb / torch / huggingface_hub / click / typer）
+          2 = click 版本 >= 8.2（需 Step2 pin click<8.2 修 typer 兼容）
+          3 = numpy 版本不符合 py 版本区间约束（py>=3.10 需 numpy>=2.1；
+              py<3.10 需 numpy<2 因为 infinity-emb 0.0.77 metadata 硬 upper <2）
+
+        20s timeout：venv python 冷启 1-3s + import torch 首次 5-10s（cu124 需
+        探 CUDA），保守留 20s 覆盖慢机器。命中场景下秒回。跟 Mac Swift 端
+        EmbeddingProcessManager.swift:venvDepsReady 完全同源，两端一致。
+        """
+        venv_python = _find_venv_python(spec.venv_dir)
+        if venv_python is None:
+            return False
+        # click / numpy 版本用 tuple(int, int) 比较，避字符串比较坑（8.10 vs 8.2）。
+        probe_script = (
+            "import sys\n"
+            "try:\n"
+            "    import infinity_emb, torch, huggingface_hub, click, typer\n"
+            "    import numpy\n"
+            "except ImportError:\n"
+            "    sys.exit(1)\n"
+            "def _v(pkg):\n"
+            "    parts = pkg.split('.')[:2]\n"
+            "    try:\n"
+            "        return tuple(int(p) for p in parts)\n"
+            "    except ValueError:\n"
+            "        return (0, 0)\n"
+            "if _v(click.__version__) >= (8, 2):\n"
+            "    sys.exit(2)\n"
+            "np_v = _v(numpy.__version__)\n"
+            "if sys.version_info >= (3, 10):\n"
+            "    if np_v < (2, 1):\n"
+            "        sys.exit(3)\n"
+            "else:\n"
+            "    if np_v >= (2, 0):\n"
+            "        sys.exit(3)\n"
+            "sys.exit(0)\n"
+        )
+        probe_cmd = [venv_python, "-c", probe_script]
+        try:
+            result = self._runner.run(
+                probe_cmd, log_path=self._pip_log_path, timeout=20.0,
+            )
+        except Exception:  # noqa: BLE001 — 探测失败退回 pip 路径，不影响正确性
+            return False
+        if result.returncode != 0:
+            logger.info(
+                "venv_deps_ready: probe failed (exit=%d, venv=%s)",
+                result.returncode, spec.venv_dir,
+            )
+        return result.returncode == 0
+
     def _download_model(self, spec: InstallSpec) -> None:
         """跑 venv 内 Python 调 snapshot_download；按 mirror_chain 顺序兜底。"""
+        # bug 1 修复（与 Mac Swift InstallExecutor.execute 同步）：snapshot_download
+        # 前先检测 local_dir 是否已含完整权重。命中即跳过整段下载（避免重装 /
+        # 升级链路把 4GB 模型重下一遍）。判定 = config.json 存在 + 至少一份
+        # ≥50MB 权重；不命中走标准 resume 路径。
+        local_dir = spec.download_args.get("local_dir", "")
+        if local_dir and _is_model_dir_complete(local_dir):
+            logger.info("model dir already complete at %s; skipping snapshot_download", local_dir)
+            self._status.flush(
+                phase="downloading", progress=0.95,
+                message="检测到本地模型权重已完整，跳过下载",
+            )
+            return
+
         last_err = ""
         # mirror_chain 优先级：spec.download_args["endpoint"]（若有）置最前 + spec.mirror_chain 其余
         chain: list[str] = []
@@ -811,9 +1018,27 @@ class InstallExecutor:
                 message=f"下载模型（{endpoint}）",
             )
             result = self._runner.run(cmd, log_path=self._pip_log_path)
+            # 护栏：huggingface_hub 撞 403 后会静默 "Returning existing local_dir"
+            # 让 returncode=0 但权重根本没下（实测 bytes_downloaded=0，只留元数据壳）。
+            # returncode=0 不再等于成功，必须 post-check 权重完整性。
             if result.returncode == 0:
-                return
-            last_err = _tail(result.stdout_tail, result.stderr_tail)
+                if local_dir and _is_model_dir_complete(local_dir):
+                    return
+                last_err = (
+                    f"snapshot_download rc=0 but weights missing at {local_dir};"
+                    " likely hub silent-fallback (mirror 403 → returned local_dir as success)."
+                    " tail=" + _tail(result.stdout_tail, result.stderr_tail)
+                )
+                logger.warning(
+                    "download via %s: silent-success detected (no weights); trying next mirror",
+                    endpoint,
+                )
+                continue
+            # 空 tail 不覆盖已有 last_err（防前一个 silent-success 详细描述
+            # 被后续 rc!=0 但 stdout/stderr 都空的失败覆盖成 "all mirrors exhausted"）
+            new_err = _tail(result.stdout_tail, result.stderr_tail)
+            if new_err:
+                last_err = new_err
             logger.warning("download via %s failed (rc=%s); trying next mirror",
                            endpoint, result.returncode)
         # 全部 mirror 都失败
@@ -841,31 +1066,75 @@ def _tail(stdout_tail: str, stderr_tail: str) -> str:
     return combined[-512:]
 
 
+def _find_venv_python(venv_dir: str) -> Optional[str]:
+    """在 venv_dir 下找 python 解释器绝对路径；跨平台探测。
+    Win = Scripts/python.exe, Mac/Linux = bin/python 或 bin/python3。
+    找不到返 None。
+    """
+    if not venv_dir:
+        return None
+    base = Path(venv_dir)
+    for rel in ("Scripts/python.exe", "bin/python", "bin/python3"):
+        p = base / rel
+        if p.exists():
+            return str(p)
+    return None
+
+
+def _is_model_dir_complete(local_dir: str) -> bool:
+    """检测本地 model 目录是否含完整权重，命中即可跳过 snapshot_download。
+
+    判定规则（保守，对齐 Mac Swift ``InstallExecutor.isModelDirComplete``）：
+    ``config.json`` 存在 且 至少一份 **PyTorch** 权重文件（pytorch_model.bin /
+    model.safetensors）单文件 >=50MB（防只下了元数据壳就被误判为完整）。
+
+    **不认 ONNX 权重**：本项目 infinity 启动模板默认 ``engine=torch``，必须
+    PyTorch 权重；若误把 onnx/model.onnx_data 当完整，会导致跳过 snapshot_download
+    后 infinity 启动撞 ``OSError: no file named pytorch_model.bin, model.safetensors,
+    ...``（exit code 3）。bge-m3 仓库同时含 onnx 副本，部分网络环境下 LFS 拉取顺序
+    会先到 onnx 后到 pt 权重，中间任何中断都可能留下"只有 onnx"的局部目录。
+
+    不命中（包括只缺一份权重）就放弃跳过，让 snapshot_download 走标准 resume 路径。
+    """
+    if not local_dir:
+        return False
+    base = Path(local_dir)
+    if not (base / "config.json").is_file():
+        return False
+    weight_candidates = (
+        "pytorch_model.bin",
+        "model.safetensors",
+    )
+    min_weight_bytes = 50 * 1024 * 1024
+    for rel in weight_candidates:
+        try:
+            size = (base / rel).stat().st_size
+        except OSError:
+            continue
+        if size >= min_weight_bytes:
+            return True
+    return False
+
+
 def _build_download_cmd(spec: InstallSpec, endpoint: str) -> list[str]:
     """生成 venv 内 Python 子进程命令：调 snapshot_download 下模型。
 
     用 Python -c 内联脚本，无需 ship 额外 .py 文件；resume_download 自带断点续传。
     """
-    # 用 Path 推断 venv python 解释器；windows venv 是 Scripts/python.exe
-    venv = Path(spec.venv_dir)
-    candidates = [
-        venv / "bin" / "python",
-        venv / "bin" / "python3",
-        venv / "Scripts" / "python.exe",
-    ]
-    for cand in candidates:
-        if cand.exists():
-            python = str(cand)
-            break
-    else:
-        # venv 还没建好或路径不预期；用 PATH 上的 python 试一次（不推荐但兜底）
-        python = "python"
+    # 用 _find_venv_python helper 探测；venv 没建好用 PATH 兜底
+    python = _find_venv_python(spec.venv_dir) or "python"
 
+    # ignore_patterns：hf-mirror 对某些非权重文件（imgs/.DS_Store 等）返 403，
+    # huggingface_hub 抓到 403 会 fallback 到 huggingface.co(国内 timeout)→
+    # 判定 "remote repo cannot be accessed" → **返回 local_dir 当作成功**，
+    # 但实际权重根本没下(bytes_downloaded=0)，install phase=completed 是假的。
+    # 跳过这些无关紧要文件避开 403，让 LFS 权重正常拉。
     script = (
         "from huggingface_hub import snapshot_download;"
         f"snapshot_download(repo_id={spec.download_args['repo_id']!r},"
         f"local_dir={spec.download_args['local_dir']!r},"
         f"endpoint={endpoint!r},"
+        "ignore_patterns=('imgs/*', '*.DS_Store', '.gitattributes'),"
         "resume_download=True)"
     )
     return [python, "-c", script]
@@ -1018,6 +1287,9 @@ class StartSpec:
     port: int               # 已选端口
     runtime_dir: Path       # 用于落 pid / port 文件
     infinity_log_path: Path # tee infinity 日志
+    # plan.env 透传：infinity 子进程必需的 env（如 INFINITY_BETTERTRANSFORMER=false
+    # 关掉 bettertransformer 探测，否则会撞 NameError(BetterTransformerManager)）
+    env: dict[str, str] = field(default_factory=dict)
 
 
 # 健康探活默认超时（秒）。AC24 分级就绪：单次探活 ≤2s，整个 warmup 上限独立配。
@@ -1052,6 +1324,11 @@ class StartHandler:
         self._clock = clock
         self._sleep = sleep
 
+    @property
+    def probe(self) -> HealthProbe:
+        """供 EmbeddingActionHandler 在 self-heal 路径里复用同一份 probe。"""
+        return self._probe
+
     def spawn_and_wait_ready(self, spec: StartSpec) -> tuple[Optional[ProcessHandle], bool, str]:
         """spawn + 探活；返回 ``(handle, ready, last_error)``。
 
@@ -1061,7 +1338,9 @@ class StartHandler:
         """
         try:
             handle = self._spawner.spawn(
-                spec.start_cmd, log_path=spec.infinity_log_path,
+                spec.start_cmd,
+                log_path=spec.infinity_log_path,
+                env=dict(spec.env) if spec.env else None,
             )
         except Exception as e:  # noqa: BLE001
             logger.exception("spawn infinity failed")
@@ -1398,6 +1677,11 @@ class EmbeddingActionHandler(ActionHandler):
             current.pid = adopt_pid
             current.port = start_spec.port
             current.model_id = desired.model_id
+            # adopt 能拿到 infinity handle 说明模型 + venv 都在盘上：filesystem
+            # 层面必然装好，回补 installed=True 让 kb-api 视图跟真实盘状一致。
+            # 防御 install handler 因 SSE 立即关闭而被跳过（2026-07-03 P0 事故）导致
+            # _actual.installed 永远停在 False，UI 显示"未安装" 但服务已在跑。
+            current.installed = True
             current.last_error = ""
             return current
 
@@ -1423,6 +1707,11 @@ class EmbeddingActionHandler(ActionHandler):
         current.port = start_spec.port
         current.model_id = desired.model_id
         current.device = desired.device
+        # spawn_and_wait_ready 能拿到 handle 说明 infinity_emb.exe 用 model + venv
+        # 起来了；filesystem 层面必然装好，回补 installed=True 让 kb-api 视图跟盘
+        # 状一致。防御 install handler 因 SSE 立即关闭而被跳过（2026-07-03 P0 事故）
+        # 导致 _actual.installed 永远停在 False，UI 显示"未安装" 但服务已在跑。
+        current.installed = True
         # restart_count 只在 stop 时归零;start 期间保留累计,supervise 触发的重启
         # 能继续往上加;用户手动 stop 后再 start 也能从 0 重新计
         current.restart_count = preserved_restart
@@ -1451,6 +1740,65 @@ class EmbeddingActionHandler(ActionHandler):
         current.restart_count = 0
         current.last_error = err if err else ("" if graceful else "force-killed after grace")
         return current
+
+    def shutdown(self) -> None:
+        """tray quit 时强制带走 infinity（与 Mac Swift 同步）。
+
+        manager.stop() 起手调用：set stop_event 后 reconcile loop 不会再
+        dispatch，但 currentHandle 持有的 infinity 子进程仍在跑——必须在
+        tray 退出前显式 SIGTERM → grace → SIGKILL，否则 infinity 成孤儿
+        （kb-tray 退出后 Windows 不会自动回收子进程；taskkill kb-api 树也
+        不带 infinity，因为 infinity 是 kb-tray 平级 spawn 的）。
+
+        runtime_dir 通过 spec_factory 传入 empty desired/actual 拿（factory
+        实现保证 model_id=空时回退到固定 runtime_dir）。stopper 自身就清
+        ``runtime/pid|port``。
+        """
+        with self._lock:
+            handle = self._current_handle
+            self._current_handle = None
+        if handle is None:
+            return
+        try:
+            ctx = self._spec_factory(DesiredStateSnapshot(), ActualStateSnapshot())
+            runtime_dir = ctx.runtime_dir or Path(".")
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "shutdown: spec_factory failed; runtime_dir fallback to cwd",
+                exc_info=True,
+            )
+            runtime_dir = Path(".")
+        try:
+            self._stopper.terminate_and_wait(handle, runtime_dir)
+        except Exception:  # noqa: BLE001
+            logger.warning("shutdown: terminate_and_wait failed", exc_info=True)
+
+    def self_heal_warmup_if_needed(self, actual):
+        """bug 2 自愈实现（与 Mac Swift ``selfHealWarmupIfNeeded`` 同步）。
+
+        触发条件（全部满足）：
+        - 当前持有 handle 且 ``poll()`` is None（进程仍活）
+        - ``actual.warming_up`` 为 true 或 ``last_error`` 含 "warmup timeout"
+        - 探活 ``/health`` 返回 200
+
+        触发后清掉 warming_up + last_error，把 running 翻 true。否则返回 None。
+        """
+        with self._lock:
+            handle = self._current_handle
+        if handle is None or handle.poll() is not None:
+            return None
+        stuck = actual.warming_up or "warmup timeout" in (actual.last_error or "")
+        if not stuck:
+            return None
+        port = actual.port if actual.port > 0 else 7687
+        if not self._starter.probe.is_ready(port):
+            return None
+
+        healed = ActualStateSnapshot(**asdict(actual))
+        healed.running = True
+        healed.warming_up = False
+        healed.last_error = ""
+        return healed
 
     def switch_model(self, desired, current):
         # stop -> install -> start;任一阶段失败立即返回，不再向下

@@ -30,7 +30,7 @@ This manual explains how to use your knowledge base system in daily engineering 
 & "$env:LocalAppData\KnowledgeBase\scripts\local-restart-direct.ps1"
 ```
 
-**Docker 版（规划中）**：在路线图上（v1.x 计划）。代码层面已实现 `KB_BACKEND=postgres` 路径与 `repository_postgres.py`，Docker 编排 artefact 待释出。
+**Docker 版**：仓库当前未提供 `docker-compose.yml` / `Dockerfile`。如需 Docker 化部署，由调用方自行编排（`KB_BACKEND=postgres` + 外部 Qdrant + uvicorn）。
 
 业务模型配置一律走控制台 `/settings` 页面写入 SQLite `system_config` 表，用户**无需**维护 `.env` 或导出环境变量。引导参数（host / port / 数据路径）由 `config/config.toml` 提供。
 

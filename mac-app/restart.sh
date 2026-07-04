@@ -43,9 +43,23 @@ pkill -f "kb-api" >/dev/null 2>&1 || true
 
 mkdir -p "$ROOT_DIR/data" "$ROOT_DIR/logs"
 
-if [[ -x "$ROOT_DIR/bin/kb-api" ]]; then
-  nohup "$ROOT_DIR/bin/kb-api" >/dev/null 2>&1 &
-  echo "Local knowledge base restarted via kb-api (port=$PORT)"
+# 2026-07-01 加 KB_APP_ROOT export：让 kb-api server_entry._install_root() 拿到
+# 明确根路径，避免推断漂移（onefile → onedir 迁移期特别重要，配置/token/version
+# 文件路径必须锁定在 ROOT_DIR，不能被 sys.executable 反推）。
+export KB_APP_ROOT="$ROOT_DIR"
+
+# 2026-07-01 onedir 布局：bin/kb-api/kb-api（新）；兼容旧 onefile 布局：bin/kb-api（老 dmg build）
+KB_API_BIN=""
+if [[ -x "$ROOT_DIR/bin/kb-api/kb-api" ]]; then
+  KB_API_BIN="$ROOT_DIR/bin/kb-api/kb-api"
+elif [[ -x "$ROOT_DIR/bin/kb-api" ]] && [[ ! -d "$ROOT_DIR/bin/kb-api" ]]; then
+  # 老 onefile 布局：bin/kb-api 是文件不是目录
+  KB_API_BIN="$ROOT_DIR/bin/kb-api"
+fi
+
+if [[ -n "$KB_API_BIN" ]]; then
+  nohup "$KB_API_BIN" >/dev/null 2>&1 &
+  echo "Local knowledge base restarted via kb-api (port=$PORT, bin=$KB_API_BIN)"
   exit 0
 fi
 

@@ -4,7 +4,7 @@
 
 本数据模型是逻辑模型，适用于两种模式：
 - 直装版：落地到 SQLite。
-- Docker 版（规划中，v1.x 计划）：落地到 PostgreSQL。
+- Docker 版：落地到 PostgreSQL。
 
 字段语义、API 输入输出和检索行为保持一致，不因平台或模式分叉。
 
