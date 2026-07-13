@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -13,6 +14,7 @@ from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Path, Que
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.metrics import metrics_middleware, metrics_response
@@ -94,6 +96,10 @@ from app.vector_index import VectorIndex
 
 logger = logging.getLogger(__name__)
 
+# 配置 mode 切换与 install/start/stop desired-state 写入必须串行化：否则旧的
+# local 启动请求可能在用户已切 external/disabled 后反盖 stop。
+_embedding_control_lock = threading.RLock()
+
 
 def _load_app_version() -> str:
     # 优先读运行目录的 VERSION（直装版打包时写入 /Applications/KnowledgeBase/VERSION）
@@ -148,6 +154,8 @@ class KnowledgeRepo(Protocol):
     ) -> list[dict[str, Any]]: ...
 
     def get_system_config(self) -> dict[str, Any]: ...
+
+    def has_system_config(self) -> bool: ...
 
     def upsert_system_config(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -316,6 +324,26 @@ def _persist_owner_token_on_startup() -> None:
     落盘失败不阻塞 kb-api 启动（只 warn）：开发者本机 / 单测场景没壳层，
     没文件也跑得起来；壳层启动时找不到文件会自己 retry。
     """
+    # uvicorn 的 lifespan startup 可能早于真实 socket bind。若另一个 kb-api
+    # 已经在目标端口监听，当前短命 loser 随后会 bind 失败；此时绝不能先把
+    # winner 的磁盘 token 覆盖。这里只做短 TCP connect，不做 bind-and-close，
+    # 避免探针自己短暂占用端口。
+    port_raw = os.getenv("KB_PORT_API", "18000").strip()
+    try:
+        port = int(port_raw)
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            logger.warning(
+                "kb-api port %d already has a listener; skip owner_token write "
+                "to avoid clobbering the running instance",
+                port,
+            )
+            return
+    except (OSError, ValueError, OverflowError):
+        # Connection refused/timeout means no confirmed listener. Invalid port
+        # will be rejected by the actual server startup; keep legacy best-effort
+        # token persistence semantics here.
+        pass
+
     state = get_embedding_service_state()
     data_root = _resolve_data_root()
     try:
@@ -770,6 +798,14 @@ def get_system_config(repo: KnowledgeRepo = Depends(get_repo)) -> dict[str, Any]
 
 @app.put("/v1/system/config", response_model=SystemConfigResponse, summary="系统配置更新")
 def put_system_config(req: SystemConfigUpsertRequest, repo: KnowledgeRepo = Depends(get_repo)) -> dict[str, Any]:
+    with _embedding_control_lock:
+        return _put_system_config_locked(req, repo)
+
+
+def _put_system_config_locked(
+    req: SystemConfigUpsertRequest,
+    repo: KnowledgeRepo,
+) -> dict[str, Any]:
     """系统配置写入。
 
     Embedding service 相关约束（tasks §2.9 + §2.10）：
@@ -783,6 +819,51 @@ def put_system_config(req: SystemConfigUpsertRequest, repo: KnowledgeRepo = Depe
       强制 ``I-CONFIRM-REINDEX`` 防误触。
     """
     current = repo.get_system_config()
+
+    # 仓储层是全量覆盖，但多个客户端（/console 简版设置页、/settings、
+    # /setup、托盘菜单等）只 PUT 自己编辑过的部分字段。Pydantic 会用 schema 默认值
+    # 填充缺失字段，导致「保存 LLM 配置」意外把 rerank / enrichment /
+    # embedding_service_* 等未编辑字段清空，以及把 embedding_service_mode
+    # 误判成「用户想改成 disabled」→ 触发 I-CONFIRM-REINDEX 强制确认。
+    #
+    # 统一兜底：凡是客户端没显式传入的可持久化字段，一律用当前库值补齐，
+    # 让「没编辑」等价于「保持不变」。confirm_reindex 是一次性请求参数、
+    # 不可持久化，不参与兜底。
+    # 拷贝一份：Pydantic setattr 会把字段加入原 model_fields_set，不能让循环中的
+    # 补值反过来污染「客户端到底显式传了什么」这一事实。
+    _sent = set(req.model_fields_set)
+    for _field in type(req).model_fields:
+        if _field == "confirm_reindex":
+            continue
+        if _field not in _sent and _field in current:
+            setattr(req, _field, current[_field])
+
+    # external/disabled 下，mode 是远程 embedding 的总开关。旧版/精简客户端
+    # 可能只提交 mode，若继续沿用库里的 embedding_enabled，会产生
+    # disabled+enabled=true 或 external+enabled=false 的矛盾配置。
+    # local 是否 ready 由壳层 actual-state 决定，保留其既有 enabled 值，待真正
+    # running 后再由 actual-state 同步为 true；普通局部保存也完整保留旧配置。
+    if "embedding_service_mode" in _sent:
+        if req.embedding_service_mode == "disabled":
+            req.embedding_enabled = False
+        elif req.embedding_service_mode == "external":
+            req.embedding_enabled = True
+
+    # managed 是 mode 的派生持久化状态，不接受客户端单独决定。这里必须在
+    # partial PUT 与当前配置合并后无条件归一，不能只处理显式提交 mode 的请求；
+    # 否则只提交 managed 的旧客户端仍能写出 local+false / external+true。
+    req.embedding_service_managed = req.embedding_service_mode == "local"
+
+    # Pydantic 默认不做 assignment validation；上面的 setattr 可能把历史 DB
+    # 脏值带进已校验对象。合并/归一化后做一次完整 round-trip，防脏值穿透到
+    # 全量 upsert。仍保留原始 _sent，后续 mode 语义只按客户端真实提交判断。
+    try:
+        req = type(req).model_validate(req.model_dump())
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(include_url=False),
+        ) from exc
 
     # §2.10 mode=local 锁外部 embedding 字段
     if req.embedding_service_mode == "local":
@@ -958,7 +1039,7 @@ def get_embedding_service_install_plan(
 
     pytorch_mirror + cuda_version：v1.3.12 加，device=cuda 时影响 pip 命令；
     缺参时从 system_config 读用户已保存的配置（保持跟 install / switch-model 端点
-    一致；v1.3.12 审计 P1）。
+    一致，v1.3.12 收口点）。
     """
     _require_owner_token(request)
     cfg = repo.get_system_config()
@@ -1038,7 +1119,11 @@ def post_embedding_service_actual_state(
     # 服务未 ready 时保留用户已保存的 config（避免 flapping 反复覆盖）。
     if payload.running and payload.port > 0:
         try:
-            _sync_running_embedding_to_config(repo, payload)
+            # 与 mode 切换共用控制锁：旧 local heartbeat 要么先同步、随后被
+            # external/disabled 覆盖，要么后执行时看到新 mode 并跳过，不能用
+            # “读旧 cfg→全量 upsert”回滚用户的新选择。
+            with _embedding_control_lock:
+                _sync_running_embedding_to_config(repo, payload)
         except Exception:  # noqa: BLE001
             logger.exception(
                 "actual-state → DB config sync 失败 (port=%s model_id=%s)",
@@ -1060,10 +1145,12 @@ def _sync_running_embedding_to_config(
     - port：直接用 payload.port (壳层探到的 /health 端口)
     - dim：从 DB config 读 model_key → MODEL_REGISTRY 查 dim。actual payload 里
            model_id 是绝对路径不好用，DB config 里的 model_key 是权威 UI 输入
-    - enabled：设 True 让 VectorIndex.from_env 走 embedding path (mode=local 时
-           local_ready 分支已经不看 enabled，但外部 mode 走这条；统一设 True 无副作用)
+    - enabled：仅 mode=local 时设 True；external/disabled 的 heartbeat 必须忽略，
+      防旧本地进程在模式切换后把用户配置重新打开
     """
     cfg = repo.get_system_config() or {}
+    if str(cfg.get("embedding_service_mode") or "disabled") != "local":
+        return
     model_key = str(cfg.get("embedding_service_model_id") or "").strip()
     if not model_key:
         return  # 用户没配 model_key，不代替他决定
@@ -1118,6 +1205,18 @@ def _sync_running_embedding_to_config(
 # ---------------------------------------------------------------------------
 
 
+def _require_local_embedding_mode(cfg: dict[str, Any]) -> None:
+    mode = str(cfg.get("embedding_service_mode") or "disabled")
+    if mode != "local":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"当前 embedding_service_mode={mode}；install/start 仅允许在 "
+                "mode=local 时执行"
+            ),
+        )
+
+
 def _resolve_data_root() -> str:
     """获取当前进程的数据根目录（runtime/ + logs/ 都挂在其下）。
 
@@ -1154,43 +1253,41 @@ def post_embedding_service_install(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    cfg = repo.get_system_config()
-    pytorch_mirror = req.pytorch_mirror or str(
-        cfg.get("embedding_service_pytorch_mirror")
-        or "https://download.pytorch.org/whl/"
-    )
-    cuda_version = req.cuda_version or str(
-        cfg.get("embedding_service_cuda_version") or "cu124"
-    )
-
     status_path, pip_log_path = resolve_install_paths(_resolve_data_root())
 
-    # 2026-07-03 P0 fix：新一轮 install 前必须 reset install_status.json，
-    # 否则 SSE streamer initial snapshot 见上一轮遗留的 phase=completed 立即
-    # close stream（install_progress.py:139）→ 壳层 auto-bootstrap POST /install
-    # 秒 return → 抢跑 POST /start → reconcile 只见 desired.action=start → install
-    # handler 从未运行 → 半装 venv/model 场景永远无法 repair，且 UI 见 installed=false。
-    # 删文件比重写非 terminal phase 更简单：SSE `_read_status_snapshot` 见 None
-    # 就等壳层第一次 flush（预期 <1s，installer._prepare 立刻写 phase=preparing）。
-    try:
-        status_path.unlink()
-    except FileNotFoundError:
-        pass
-    except OSError:
-        logger.warning(
-            "failed to reset %s before install; SSE may close early if stale terminal phase",
-            status_path, exc_info=True,
+    with _embedding_control_lock:
+        cfg = repo.get_system_config()
+        _require_local_embedding_mode(cfg)
+        pytorch_mirror = req.pytorch_mirror or str(
+            cfg.get("embedding_service_pytorch_mirror")
+            or "https://download.pytorch.org/whl/"
+        )
+        cuda_version = req.cuda_version or str(
+            cfg.get("embedding_service_cuda_version") or "cu124"
         )
 
-    state = get_embedding_service_state()
-    state.bump_desired(
-        action="install",
-        model_id=req.model_id,
-        device=req.device,
-        enabled=True,
-        pytorch_mirror=pytorch_mirror,
-        cuda_version=cuda_version,
-    )
+        # 2026-07-03 P0 fix：新一轮 install 前必须 reset install_status.json，
+        # 否则 SSE streamer initial snapshot 见上一轮遗留的 phase=completed 立即
+        # close stream。reset 与 desired bump 同锁，避免壳层刚写的新状态又被删。
+        try:
+            status_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning(
+                "failed to reset %s before install; SSE may close early if stale terminal phase",
+                status_path, exc_info=True,
+            )
+
+        state = get_embedding_service_state()
+        state.bump_desired(
+            action="install",
+            model_id=req.model_id,
+            device=req.device,
+            enabled=True,
+            pytorch_mirror=pytorch_mirror,
+            cuda_version=cuda_version,
+        )
 
     streamer = InstallSseStreamer(
         status_path=status_path,
@@ -1216,22 +1313,39 @@ def post_embedding_service_start(
     req: EmbeddingServiceStartStopRequest = Body(default_factory=EmbeddingServiceStartStopRequest),
     repo: KnowledgeRepo = Depends(get_repo),
 ) -> dict[str, Any]:
-    state = get_embedding_service_state()
-    # model_id 兜底链：req > prev desired > DB config > "bge-m3"（防 desired + req 空态）
-    # device 兜底链：req > prev desired > DB config > "cpu"（2026-07-02 P1-2 fix：
-    # auto-bootstrap 场景 prev.device 是空的走 "cpu" 会吞掉 DB 里的 mps/cuda 配置）
-    prev = state.desired()
-    cfg = repo.get_system_config()
-    model_id = req.model_id or prev.model_id or str(cfg.get("embedding_service_model_id") or "bge-m3")
-    device = req.device or prev.device or str(cfg.get("embedding_service_device") or "cpu")
-    d = state.bump_desired(
-        action="start",
-        model_id=model_id,
-        device=device,
-        enabled=True,
-        pytorch_mirror=prev.pytorch_mirror,
-        cuda_version=prev.cuda_version,
-    )
+    with _embedding_control_lock:
+        state = get_embedding_service_state()
+        # model_id 兜底链：req > prev desired > DB config > "bge-m3"（防 desired + req 空态）
+        # device 兜底链：req > prev desired > DB config > "cpu"（2026-07-02 P1-2 fix：
+        # auto-bootstrap 场景 prev.device 是空的走 "cpu" 会吞掉 DB 里的 mps/cuda 配置）
+        prev = state.desired()
+        cfg = repo.get_system_config()
+        _require_local_embedding_mode(cfg)
+        if req.expected_generation is not None and (
+            prev.generation != req.expected_generation or prev.action != "install"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "start 前置 generation 已过期；当前 desired="
+                    f"{prev.action}@{prev.generation}，请求基于 install@"
+                    f"{req.expected_generation}"
+                ),
+            )
+        model_id = req.model_id or prev.model_id or str(
+            cfg.get("embedding_service_model_id") or "bge-m3"
+        )
+        device = req.device or prev.device or str(
+            cfg.get("embedding_service_device") or "cpu"
+        )
+        d = state.bump_desired(
+            action="start",
+            model_id=model_id,
+            device=device,
+            enabled=True,
+            pytorch_mirror=prev.pytorch_mirror,
+            cuda_version=prev.cuda_version,
+        )
     return {
         "action": d.action, "model_id": d.model_id, "device": d.device,
         "enabled": d.enabled,
@@ -1246,16 +1360,17 @@ def post_embedding_service_start(
     summary="停止 Embedding 服务（仅改期望状态，壳层 reconcile）",
 )
 def post_embedding_service_stop() -> dict[str, Any]:
-    state = get_embedding_service_state()
-    prev = state.desired()
-    d = state.bump_desired(
-        action="stop",
-        model_id=prev.model_id,
-        device=prev.device or "cpu",
-        enabled=False,
-        pytorch_mirror=prev.pytorch_mirror,
-        cuda_version=prev.cuda_version,
-    )
+    with _embedding_control_lock:
+        state = get_embedding_service_state()
+        prev = state.desired()
+        d = state.bump_desired(
+            action="stop",
+            model_id=prev.model_id,
+            device=prev.device or "cpu",
+            enabled=False,
+            pytorch_mirror=prev.pytorch_mirror,
+            cuda_version=prev.cuda_version,
+        )
     return {
         "action": d.action, "model_id": d.model_id, "device": d.device,
         "enabled": d.enabled,
@@ -1303,24 +1418,26 @@ def post_embedding_service_switch_model(
             detail="向量索引重建进行中，请等 rebuild 完成或先 abort 再切模型",
         )
 
-    cfg = repo.get_system_config()
-    pytorch_mirror = req.pytorch_mirror or str(
-        cfg.get("embedding_service_pytorch_mirror")
-        or "https://download.pytorch.org/whl/"
-    )
-    cuda_version = req.cuda_version or str(
-        cfg.get("embedding_service_cuda_version") or "cu124"
-    )
+    with _embedding_control_lock:
+        cfg = repo.get_system_config()
+        _require_local_embedding_mode(cfg)
+        pytorch_mirror = req.pytorch_mirror or str(
+            cfg.get("embedding_service_pytorch_mirror")
+            or "https://download.pytorch.org/whl/"
+        )
+        cuda_version = req.cuda_version or str(
+            cfg.get("embedding_service_cuda_version") or "cu124"
+        )
 
-    state = get_embedding_service_state()
-    d = state.bump_desired(
-        action="switch_model",
-        model_id=req.model_id,
-        device=req.device,
-        enabled=True,
-        pytorch_mirror=pytorch_mirror,
-        cuda_version=cuda_version,
-    )
+        state = get_embedding_service_state()
+        d = state.bump_desired(
+            action="switch_model",
+            model_id=req.model_id,
+            device=req.device,
+            enabled=True,
+            pytorch_mirror=pytorch_mirror,
+            cuda_version=cuda_version,
+        )
     return {
         "action": d.action,
         "model_id": d.model_id,
@@ -1629,7 +1746,8 @@ def _build_backup_service(repo: Any) -> BackupService:
     "/v1/system/backup/export",
     summary="导出全量备份（流式 tar.gz）",
     description=(
-        "导出全量备份为 tar.gz：knowledge.db + qdrant_local + 脱敏后的 system_config。"
+        "导出全量备份为 tar.gz：knowledge.db + qdrant_local + 脱敏配置 sidecar。"
+        " 注意：完整 knowledge.db 仍包含 system_config 真凭证，整个备份包不是脱敏产物。"
         " 包内含 manifest.json（schema_version=1 + db sha256 + stats + embedding 配置）。"
         " maintenance flag 置位时返回 503；postgres backend 返 501；磁盘不足返 507。"
     ),
@@ -1891,6 +2009,31 @@ def restart_local_service() -> dict[str, Any]:
                 restart_script = scripts_dir / "local-restart.ps1"
             if not restart_script.exists():
                 raise HTTPException(status_code=404, detail="restart script not found")
+            restart_env = os.environ.copy()
+            restart_env["KB_RESTART_SCRIPT"] = str(restart_script)
+            # v2 P0-5: 预检脚本 PowerShell 5.1 ParseFile 通过, 防假绿
+            # (无 BOM UTF-8 脚本被 PS 5.1 按 ANSI 读会 parse fail, 但 fire-and-forget
+            # Popen 拿不到 exit code, API 会返 ok=true 但脚本根本没跑)
+            precheck = subprocess.run(
+                [
+                    "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                    "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+                    "$errs = $null; $tokens = $null; "
+                    "$null = [System.Management.Automation.Language.Parser]::ParseFile("
+                    "$env:KB_RESTART_SCRIPT, [ref]$tokens, [ref]$errs); "
+                    f"if ($errs.Count -gt 0) {{ Write-Error ($errs | ForEach-Object {{ $_.Message }}) -ErrorAction Stop; exit 1 }}; "
+                    f"exit 0",
+                ],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10.0,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                env=restart_env,
+            )
+            if precheck.returncode != 0:
+                # 脚本 parse 失败, 返 500 + 明确 err 让 tray/client 知道 restart 未启动
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"restart script parse failed (PS 5.1 syntax error): {precheck.stderr[:500]}",
+                )
             subprocess.Popen(
                 [
                     "powershell.exe",
@@ -1898,13 +2041,14 @@ def restart_local_service() -> dict[str, Any]:
                     "-ExecutionPolicy",
                     "Bypass",
                     "-Command",
-                    f"Start-Sleep -Seconds 1; & '{str(restart_script)}'",
+                    "Start-Sleep -Seconds 1; & $env:KB_RESTART_SCRIPT",
                 ],
                 cwd=str(root_dir),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=subprocess.CREATE_NO_WINDOW,
+                env=restart_env,
             )
         elif sys.platform == "darwin":
             # 直装版优先（scripts/restart.sh：由 build_mac_direct_install_dmg.sh 从 mac-app/restart.sh 拷过来）

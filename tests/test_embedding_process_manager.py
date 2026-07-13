@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -346,11 +348,19 @@ class _FakeKbApi:
     def __init__(self) -> None:
         self.desired_queue: list[DesiredStateSnapshot] = []
         self.desired_errors: list[BaseException | None] = []
+        self.on_get_desired: Callable[[], None] | None = None
         self.actual_posts: list[ActualStateSnapshot] = []
+        self.start_cas_calls: list[tuple[int, str, str]] = []
+        self.start_cas_errors: list[BaseException | None] = []
         # actual post 副作用：默认返 200；可塞异常
         self.actual_errors: list[BaseException | None] = []
+        self.enforce_monotonic_actual_ack = False
+        self.accepted_actual_ack = 0
+        self.rejected_actual_acks: list[int] = []
 
     def get_desired(self) -> DesiredStateSnapshot:
+        if self.on_get_desired is not None:
+            self.on_get_desired()
         if self.desired_errors:
             err = self.desired_errors.pop(0)
             if err is not None:
@@ -374,31 +384,58 @@ class _FakeKbApi:
             "restart_count": snap.restart_count,
             "last_error": snap.last_error,
         }))
+        if (
+            self.enforce_monotonic_actual_ack
+            and snap.acknowledged_generation < self.accepted_actual_ack
+        ):
+            self.rejected_actual_acks.append(snap.acknowledged_generation)
+            raise KbApiConflict("stale acknowledged_generation")
         if self.actual_errors:
             err = self.actual_errors.pop(0)
             if err is not None:
                 raise err
+        if self.enforce_monotonic_actual_ack:
+            self.accepted_actual_ack = max(
+                self.accepted_actual_ack, snap.acknowledged_generation,
+            )
         return {
             "accepted": True,
             "acknowledged_generation": snap.acknowledged_generation,
             "updated_at": 0.0,
         }
 
+    def post_start_cas(
+        self, *, expected_generation: int, model_id: str, device: str,
+    ) -> dict:
+        self.start_cas_calls.append((expected_generation, model_id, device))
+        if self.start_cas_errors:
+            err = self.start_cas_errors.pop(0)
+            if err is not None:
+                raise err
+        return {"accepted": True}
+
 
 class _RecordingHandler(ActionHandler):
-    """记录被调用 + 可注入返回值；任何方法未配返回值则用 NotImplementedError."""
+    """记录被调用 + 可注入返回值；任何方法未配返回值则用 NotImplementedError.
+
+    v2 (P0-1): 每个 handler 返回 ``(snapshot, succeeded)`` 元组。
+    - ``responses[name]`` 存 snapshot; 默认 succeeded=True (可用 ``failed_actions`` 覆盖)
+    - ``failed_actions`` 集合里的 action 返 succeeded=False (业务失败, 正常返回 snapshot 不抛异常)
+    """
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, DesiredStateSnapshot]] = []
         self.responses: dict[str, ActualStateSnapshot] = {}
         self.exceptions: dict[str, BaseException] = {}
+        self.failed_actions: set[str] = set()  # v2: 业务失败但正常返回的 action
 
-    def _do(self, name: str, desired: DesiredStateSnapshot, current: ActualStateSnapshot) -> ActualStateSnapshot:
+    def _do(self, name: str, desired: DesiredStateSnapshot, current: ActualStateSnapshot) -> tuple[ActualStateSnapshot, bool]:
         self.calls.append((name, desired))
         if name in self.exceptions:
             raise self.exceptions[name]
         if name in self.responses:
-            return self.responses[name]
+            succeeded = name not in self.failed_actions
+            return self.responses[name], succeeded
         raise NotImplementedError(f"no canned response for {name}")
 
     def install(self, desired, current):
@@ -460,6 +497,103 @@ class TestReconcileTick:
         assert api.actual_posts[-1].installed is True
         assert api.actual_posts[-1].model_id == "bge-m3"
 
+    def test_install_chain_success_posts_start_before_ack(self):
+        api = _FakeKbApi()
+        desired = DesiredStateSnapshot(
+            action="install", model_id="bge-m3", device="cpu", generation=7,
+        )
+        api.desired_queue.append(desired)
+        handler = _RecordingHandler()
+        handler.responses["install"] = ActualStateSnapshot(installed=True)
+        mgr = _make_manager(api=api, handler=handler)
+        mgr.set_start_after_install_requested(True)
+
+        mgr._tick()  # noqa: SLF001
+
+        assert api.start_cas_calls == [(7, "bge-m3", "cpu")]
+        assert api.actual_posts[-1].acknowledged_generation == 7
+
+    def test_install_chain_transport_failure_retries_same_generation(self):
+        api = _FakeKbApi()
+        desired = DesiredStateSnapshot(
+            action="install", model_id="bge-m3", device="cpu", generation=7,
+        )
+        api.desired_queue.extend([desired, desired])
+        api.start_cas_errors.extend([KbApiTransportError("temporary"), None])
+        handler = _RecordingHandler()
+        handler.responses["install"] = ActualStateSnapshot(installed=True)
+        mgr = _make_manager(api=api, handler=handler)
+        mgr.set_start_after_install_requested(True)
+
+        mgr._tick()  # noqa: SLF001
+        assert mgr._last_done_generation < 7  # noqa: SLF001
+        assert api.actual_posts[-1].acknowledged_generation == 0
+        assert mgr._start_after_install_requested is True  # noqa: SLF001
+
+        mgr._tick()  # noqa: SLF001
+        assert [name for name, _ in handler.calls] == ["install", "install"]
+        assert api.start_cas_calls == [
+            (7, "bge-m3", "cpu"),
+            (7, "bge-m3", "cpu"),
+        ]
+        assert api.actual_posts[-1].acknowledged_generation == 7
+
+    def test_install_chain_conflict_is_terminal_for_old_generation(self):
+        api = _FakeKbApi()
+        api.desired_queue.append(DesiredStateSnapshot(
+            action="install", model_id="bge-m3", device="cpu", generation=7,
+        ))
+        api.start_cas_errors.append(KbApiConflict("desired changed"))
+        handler = _RecordingHandler()
+        handler.responses["install"] = ActualStateSnapshot(installed=True)
+        mgr = _make_manager(api=api, handler=handler)
+        mgr.set_start_after_install_requested(True)
+
+        mgr._tick()  # noqa: SLF001
+
+        assert api.actual_posts[-1].acknowledged_generation == 7
+        assert mgr._start_after_install_requested is False  # noqa: SLF001
+
+    def test_successful_actual_post_persists_ack_for_next_start_interim(self, tmp_path):
+        api = _FakeKbApi()
+        api.enforce_monotonic_actual_ack = True
+        api.desired_queue.extend([
+            DesiredStateSnapshot(action="install", model_id="bge-m3", generation=7),
+            DesiredStateSnapshot(action="start", model_id="bge-m3", generation=8),
+        ])
+        handler = _make_action_handler(
+            install_spec=_make_install_spec(tmp_path),
+            start_spec=_make_start_spec(tmp_path),
+            runtime_dir=tmp_path / "runtime",
+        )
+        mgr = _make_manager(api=api, handler=handler)
+
+        mgr._tick()  # noqa: SLF001
+        in_memory_ack_after_install = mgr.snapshot_actual().acknowledged_generation
+        mgr._tick()  # noqa: SLF001
+
+        assert api.rejected_actual_acks == [], (
+            "next-generation start interim reused stale in-memory ack "
+            f"{in_memory_ack_after_install} after install ack 7 was accepted"
+        )
+        assert api.actual_posts[1].warming_up is True
+        assert api.actual_posts[1].acknowledged_generation == 7
+
+    def test_stop_during_get_desired_does_not_dispatch_new_action(self):
+        api = _FakeKbApi()
+        api.desired_queue.append(DesiredStateSnapshot(
+            action="install", model_id="bge-m3", generation=9,
+        ))
+        handler = _RecordingHandler()
+        handler.responses["install"] = ActualStateSnapshot(installed=True)
+        mgr = _make_manager(api=api, handler=handler)
+        api.on_get_desired = mgr._stop_event.set  # noqa: SLF001
+
+        mgr._tick()  # noqa: SLF001
+
+        assert handler.calls == []
+        assert api.actual_posts == []
+
     def test_skips_duplicate_generation(self):
         """同一 generation 已 done → 后续 tick 不再 dispatch（contract §4 幂等）。"""
         api = _FakeKbApi()
@@ -499,8 +633,69 @@ class TestReconcileTick:
         mgr._tick()  # noqa: SLF001
 
         assert api.actual_posts[-1].last_error.startswith("install failed: disk full")
-        # generation 仍被 ack，避免 reconcile 死循环重试
+        # dispatch 失败 → 不 ack，保留 desired 供下轮同 generation 重试（对齐 Mac
+        # writeActual(acknowledgeDesired: false)）。旧的"死循环回避"反哲学改成
+        # bumpBackoff + 重试。
+        assert api.actual_posts[-1].acknowledged_generation == 0
+        # _last_done_generation 保持初始值 (-1)，未推进到 desired.generation=1。
+        assert mgr._last_done_generation < 1  # noqa: SLF001
+
+    def test_handler_business_failure_does_not_ack_and_retries(self):
+        """handler 正常返回 ``succeeded=False`` 与抛异常具有相同的重试语义。"""
+        api = _FakeKbApi()
+        desired = DesiredStateSnapshot(
+            action="install", model_id="m", generation=1,
+        )
+        api.desired_queue.extend([desired, desired])
+        handler = _RecordingHandler()
+        handler.responses["install"] = ActualStateSnapshot(
+            installed=False, last_error="install failed",
+        )
+        handler.failed_actions.add("install")
+        mgr = _make_manager(api=api, handler=handler)
+
+        mgr._tick()  # noqa: SLF001
+
+        assert api.actual_posts[-1].acknowledged_generation == 0
+        assert mgr._last_done_generation < 1  # noqa: SLF001
+        assert mgr._backoff == 1.0  # noqa: SLF001
+
+        handler.failed_actions.clear()
+        handler.responses["install"] = ActualStateSnapshot(installed=True)
+        mgr._tick()  # noqa: SLF001
+
+        assert [name for name, _ in handler.calls] == ["install", "install"]
         assert api.actual_posts[-1].acknowledged_generation == 1
+
+    def test_failed_dispatch_retries_same_generation(self):
+        """连续两轮 tick：handler 先抛异常保留 desired，第二轮成功后才 ack 推进。"""
+        api = _FakeKbApi()
+        api.desired_queue.append(DesiredStateSnapshot(action="install", model_id="m", generation=1))
+        api.desired_queue.append(DesiredStateSnapshot(action="install", model_id="m", generation=1))
+        handler = _RecordingHandler()
+        handler.exceptions["install"] = RuntimeError("first attempt fails")
+        mgr = _make_manager(api=api, handler=handler)
+        mgr._tick()  # noqa: SLF001
+
+        del handler.exceptions["install"]
+        handler.responses["install"] = ActualStateSnapshot(
+            acknowledged_generation=0, installed=True,
+        )
+        mgr._tick()  # noqa: SLF001
+
+        assert [c[0] for c in handler.calls] == ["install", "install"]
+        assert api.actual_posts[-1].acknowledged_generation == 1
+
+    def test_failed_dispatch_bumps_backoff(self):
+        """dispatch 失败 → backoff 从 0 升到 1.0，下轮 sleep 会退避。"""
+        api = _FakeKbApi()
+        api.desired_queue.append(DesiredStateSnapshot(action="install", model_id="m", generation=1))
+        handler = _RecordingHandler()
+        handler.exceptions["install"] = RuntimeError("disk full")
+        mgr = _make_manager(api=api, handler=handler)
+        assert mgr._backoff == 0.0  # noqa: SLF001
+        mgr._tick()  # noqa: SLF001
+        assert mgr._backoff == 1.0  # noqa: SLF001
 
     def test_unknown_action_records_error_no_handler_call(self):
         api = _FakeKbApi()
@@ -580,6 +775,25 @@ class TestReconcileHeartbeat:
         clock.now += 6.0
         mgr._tick()  # noqa: SLF001
         assert len(api.actual_posts) == 2
+
+    @pytest.mark.parametrize(
+        "post_error",
+        [
+            pytest.param(KbApiTransportError("offline"), id="transport"),
+            pytest.param(KbApiConflict("stale"), id="409"),
+            pytest.param(KbApiUnauthorized("bad token"), id="401"),
+        ],
+    )
+    def test_unsuccessful_post_actual_does_not_persist_ack(self, post_error):
+        api = _FakeKbApi()
+        api.desired_queue.append(DesiredStateSnapshot(action="none", generation=4))
+        api.actual_errors.append(post_error)
+        mgr = _make_manager(api=api)
+
+        mgr._tick()  # noqa: SLF001
+
+        assert api.actual_posts[-1].acknowledged_generation == 4
+        assert mgr.snapshot_actual().acknowledged_generation == 0
 
     def test_409_on_post_actual_swallowed(self):
         api = _FakeKbApi()
@@ -1113,9 +1327,14 @@ class TestStartHandlerHealth:
         assert ready is True and err == ""
         assert probe.calls == 3
 
-    def test_timeout_returns_handle_with_warming(self, tmp_path):
-        """超时但子进程仍活着：返回 handle + ready=False + 超时错。
-        让 manager 后续 tick 继续观测，不算 spawn 失败。"""
+    def test_timeout_preserves_live_handle_for_self_heal(self, tmp_path):
+        """v2 P0-2 (翻回 Mac): warmup 超时 SHALL 保留活 handle, 不 terminate。
+
+        对齐 Mac Swift ``doStart`` warmup timeout 分支 (EmbeddingProcessManager.swift:1759-1780):
+        活 handle 表示 start 接管成功, actual 保 warming_up=True, self_heal_warmup
+        后续探测 /health 200 消化 warming 状态。避免慢机 120s+ warmup 被误杀 +
+        terminate 若未生效反成 orphan 且归属证据已删的双重风险。
+        """
         spawner = _RecordingSpawner()
         probe = _ScriptedProbe([])  # 永远不 ready
         clock = _FakeClock()
@@ -1130,9 +1349,13 @@ class TestStartHandlerHealth:
         )
 
         handle, ready, err = handler.spawn_and_wait_ready(_make_start_spec(tmp_path))
-        assert handle is not None
+        # v2: 保留活 handle, 不 terminate
+        assert handle is not None, "warmup timeout 应保留活 handle 待 self_heal 兜底"
+        assert handle is spawner.next_handle
         assert ready is False
         assert "warmup timeout" in err
+        # 校验 terminate **未**被调用 (关键: v2 不主动杀)
+        assert spawner.next_handle.terminate_calls == 0, "warmup timeout 不再主动 terminate handle"
 
     def test_early_exit_detected(self, tmp_path):
         """子进程 spawn 后立即崩 → poll() 返非 None → 立即失败返回。"""
@@ -1147,6 +1370,66 @@ class TestStartHandlerHealth:
         assert handle is None
         assert ready is False
         assert "exited during warmup with code 137" in err
+
+
+class TestStartHandlerLifecycle:
+    def test_on_spawn_called_after_successful_spawn(self, tmp_path):
+        """G2: spawn 成功后立即调 on_spawn(handle),让 caller 早登记 handle。"""
+        spawner = _RecordingSpawner()
+        handler = _make_handler(_ScriptedProbe([True]), spawner=spawner)
+        received: list = []
+        handle, ready, err = handler.spawn_and_wait_ready(
+            _make_start_spec(tmp_path),
+            on_spawn=received.append,
+        )
+        assert ready is True and err == ""
+        assert len(received) == 1
+        assert received[0] is handle  # on_spawn 拿到的和最终返回的是同一个 handle
+
+    def test_on_spawn_called_before_pid_file_write(self, tmp_path):
+        """G2: on_spawn 应在 spawn 立即调,而不是等 pid/port 文件写完;
+        这样即使 warmup 还没开始,shutdown 已经能看到 handle 阻止 orphan。"""
+        spawner = _RecordingSpawner()
+        # probe=[True] → warmup loop 首个 iteration 就 ready → return handle, True
+        handler = _make_handler(_ScriptedProbe([True]), spawner=spawner)
+        received: list = []
+
+        def spy(h):
+            # 断言 on_spawn 被调时 pid 属性已可读 (spawn 后立即)
+            received.append(h.pid)
+
+        handler.spawn_and_wait_ready(
+            _make_start_spec(tmp_path),
+            on_spawn=spy,
+        )
+        assert received == [spawner.next_handle.pid]
+
+    def test_stop_event_during_warmup_terminates_early(self, tmp_path):
+        """N7: warmup 轮询期间 stop_event 被 set → terminate handle + 返回 None。
+        对齐 Mac StartHandler stop_event 检查点。"""
+        spawner = _RecordingSpawner()
+        probe = _ScriptedProbe([False, False, False])
+        clock = _FakeClock()
+        sleep = _FakeSleep(clock)
+        handler = StartHandler(
+            spawner=spawner,
+            probe=probe,
+            warmup_timeout_sec=10.0,
+            probe_interval_sec=1.0,
+            clock=clock,
+            sleep=sleep,
+        )
+        stop_event = threading.Event()
+        stop_event.set()
+
+        handle, ready, err = handler.spawn_and_wait_ready(
+            _make_start_spec(tmp_path),
+            stop_event=stop_event,
+        )
+        assert handle is None
+        assert ready is False
+        assert "interrupted by stop_event" in err
+        assert spawner.next_handle.terminate_calls >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -1225,6 +1508,8 @@ class TestStopHandlerForceKill:
         """SIGKILL 后仍存活（极端情况，验证 last_error 报告）。"""
         runtime_dir = tmp_path / "runtime"
         runtime_dir.mkdir()
+        (runtime_dir / "pid").write_text("789", encoding="utf-8")
+        (runtime_dir / "port").write_text("7687", encoding="utf-8")
         handle = _FakeHandle(pid=789)  # 始终不退出
         clock = _FakeClock()
         sleep = _FakeSleep(clock)
@@ -1234,6 +1519,42 @@ class TestStopHandlerForceKill:
         assert handle.terminate_calls == 1
         assert handle.kill_calls == 1
         assert "did not respond to SIGKILL" in err
+        assert (runtime_dir / "pid").read_text(encoding="utf-8") == "789"
+        assert (runtime_dir / "port").read_text(encoding="utf-8") == "7687"
+
+    def test_adopted_unknown_owner_probe_does_not_fake_graceful_stop(
+        self, monkeypatch, tmp_path,
+    ):
+        """PID 活着但 cmdline 查询失败时，stop 必须失败并保留归属证据。"""
+        import embedding_process_manager as manager_module
+
+        class EmptyProbe:
+            def cmdline(self, _pid):
+                return ""
+
+        monkeypatch.setattr(manager_module, "_pid_alive", lambda _pid: True)
+        handle = manager_module._AdoptedHandle(  # noqa: SLF001
+            pid=789,
+            expected_model_id="bge-m3",
+            expected_port=7687,
+            cmdline_probe=EmptyProbe(),
+        )
+        runtime_dir = tmp_path / "runtime-unknown-owner"
+        runtime_dir.mkdir()
+        (runtime_dir / "pid").write_text("789", encoding="ascii")
+        (runtime_dir / "port").write_text("7687", encoding="ascii")
+        clock = _FakeClock()
+        sleep = _FakeSleep(clock)
+        stop = StopHandler(
+            grace_sec=0.2, poll_interval_sec=0.1, clock=clock, sleep=sleep,
+        )
+
+        graceful, err = stop.terminate_and_wait(handle, runtime_dir)
+
+        assert graceful is False
+        assert "SIGKILL" in err
+        assert (runtime_dir / "pid").exists()
+        assert (runtime_dir / "port").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1363,9 +1684,16 @@ class _StubStarter(StartHandler):
         self.ready: bool = True
         self.err: str = ""
         self.calls: list[StartSpec] = []
+        self.on_spawn_calls: list[ProcessHandle] = []
+        self.stop_event_seen = None
 
-    def spawn_and_wait_ready(self, spec):  # type: ignore[override]
+    def spawn_and_wait_ready(self, spec, on_spawn=None, stop_event=None):  # type: ignore[override]
         self.calls.append(spec)
+        self.stop_event_seen = stop_event
+        # 模拟 real StartHandler：spawn 成功后立刻触发 on_spawn（让 caller 早登记 handle）
+        if on_spawn is not None and self.handle_to_return is not None:
+            on_spawn(self.handle_to_return)
+            self.on_spawn_calls.append(self.handle_to_return)
         return self.handle_to_return, self.ready, self.err
 
 
@@ -1417,7 +1745,8 @@ class TestEmbeddingActionHandlerInstall:
             install_spec=_make_install_spec(tmp_path),
         )
         desired = DesiredStateSnapshot(action="install", model_id="bge-m3", device="cpu", generation=1)
-        out = h.install(desired, ActualStateSnapshot())
+        out, succeeded = h.install(desired, ActualStateSnapshot())
+        assert succeeded is True  # v2 P0-1: 真实业务成功
         assert out.installed is True
         assert out.model_id == "bge-m3"
         assert out.last_error == ""
@@ -1429,13 +1758,15 @@ class TestEmbeddingActionHandlerInstall:
             install_spec=_make_install_spec(tmp_path),
         )
         desired = DesiredStateSnapshot(action="install", model_id="bge-m3", generation=1)
-        out = h.install(desired, ActualStateSnapshot())
+        out, succeeded = h.install(desired, ActualStateSnapshot())
+        assert succeeded is False  # v2 P0-1: 业务失败不 ack, 下轮同 generation 重试
         assert out.installed is False
         assert "install failed" in out.last_error
 
     def test_install_missing_spec_short_circuits(self):
         h = _make_action_handler(install_spec=None)
-        out = h.install(DesiredStateSnapshot(action="install"), ActualStateSnapshot())
+        out, succeeded = h.install(DesiredStateSnapshot(action="install"), ActualStateSnapshot())
+        assert succeeded is False  # v2 P0-1: spec 缺失是业务失败
         assert "install spec missing" in out.last_error
 
 
@@ -1450,25 +1781,109 @@ class TestEmbeddingActionHandlerStart:
         desired = DesiredStateSnapshot(
             action="start", model_id="bge-m3", device="cpu", enabled=True, generation=2,
         )
-        out = h.start(desired, ActualStateSnapshot())
+        out, succeeded = h.start(desired, ActualStateSnapshot())
+        assert succeeded is True  # v2: 正常 spawn ready
         assert out.running is True
         assert out.warming_up is False
         assert out.pid == 1111
         assert h.current_handle is not None
 
-    def test_warming_up_when_probe_times_out(self, tmp_path):
+    def test_pre_spawn_publishes_warming_interim(self, tmp_path):
+        """N9: pre-spawn 阶段 EmbeddingActionHandler 应主动推 warming_up=True + installed=True
+        + pid=None + port=<预期> 的 interim snapshot 到 kb-api,让 UI 在 120s warmup
+        期间不误报"未安装"。对齐 Mac ``doStart`` pre-spawn writeActual(acknowledgeDesired: false)。
+        """
+        published: list = []
         starter = _StubStarter()
-        starter.ready = False
-        starter.err = "warmup timeout"
         h = _make_action_handler(
             starter=starter,
             start_spec=_make_start_spec(tmp_path),
             runtime_dir=tmp_path / "runtime",
         )
-        out = h.start(DesiredStateSnapshot(action="start", model_id="bge-m3", enabled=True), ActualStateSnapshot())
+        h.bind_lifecycle_hooks(stop_event=threading.Event(), publish_interim=published.append)
+        h.start(
+            DesiredStateSnapshot(action="start", model_id="bge-m3", device="cpu", enabled=True),
+            ActualStateSnapshot(),
+        )
+        # 至少一次 interim 满足 pre-spawn warming 契约
+        warmings = [
+            s for s in published
+            if s.warming_up and s.installed and s.pid is None
+            and s.port == 7687 and s.running is False
+        ]
+        assert len(warmings) >= 1, f"no pre-spawn warming interim; published={published!r}"
+
+    def test_on_spawn_early_registers_handle(self, tmp_path):
+        """G2: warmup 期间 _current_handle 已被 on_spawn 早登记,shutdown 能看到。"""
+        starter = _StubStarter()  # 默认 ready=True + handle=_FakeHandle(1111)
+        h = _make_action_handler(
+            starter=starter,
+            start_spec=_make_start_spec(tmp_path),
+            runtime_dir=tmp_path / "runtime",
+        )
+        h.bind_lifecycle_hooks(stop_event=threading.Event(), publish_interim=lambda s: None)
+        h.start(
+            DesiredStateSnapshot(action="start", model_id="bge-m3", device="cpu", enabled=True),
+            ActualStateSnapshot(),
+        )
+        # _StubStarter 会在 spawn_and_wait_ready 内立刻回调 on_spawn
+        assert len(starter.on_spawn_calls) == 1
+        assert h.current_handle is not None
+        assert h.current_handle.pid == 1111
+
+    def test_stop_event_during_warmup_clears_state(self, tmp_path):
+        """N7: warmup 中 stop_event.set() → EmbeddingActionHandler.start 清 handle +
+        running=False + pid=None + last_error=""(exit clean,不是 warmup 失败)。"""
+        starter = _StubStarter()
+        starter.handle_to_return = None  # 模拟 real spawn_and_wait_ready 已 terminate + 返回 None
+        starter.ready = False
+        starter.err = "warmup interrupted by stop_event"
+        h = _make_action_handler(
+            starter=starter,
+            start_spec=_make_start_spec(tmp_path),
+            runtime_dir=tmp_path / "runtime",
+        )
+        stop_event = threading.Event()
+        stop_event.set()  # 模拟 tray quit 触发
+        h.bind_lifecycle_hooks(stop_event=stop_event, publish_interim=lambda s: None)
+        out, succeeded = h.start(
+            DesiredStateSnapshot(action="start", model_id="bge-m3", device="cpu", enabled=True),
+            ActualStateSnapshot(),
+        )
+        assert succeeded is False  # v2: stop_event 早触发, tray 已在退出, 不 ack
+        assert out.running is False
+        assert out.warming_up is False
+        assert out.pid is None
+        assert out.last_error == ""
+        assert h.current_handle is None
+
+    def test_warmup_timeout_preserves_live_handle_for_self_heal(self, tmp_path):
+        """v2 P0-2 (翻回 Mac): warmup 超时 SHALL 保留活 handle, 不 terminate。
+
+        real spawn_and_wait_ready 返回 (handle, False, "warmup timeout after Xs")。
+        EmbeddingActionHandler.start 应保留 _current_handle + warming_up=True + running=True
+        + pid=handle.pid, 让 self_heal_warmup 后续探测 /health 200 消化 warming 状态。
+        succeeded=True 因为 start 已接管成功 (对齐 Mac Swift doStart L1759-1780)。
+        """
+        starter = _StubStarter()
+        # v2: starter 应返回活 handle, 不再 None
+        starter.ready = False
+        starter.err = "warmup timeout after 3.0s"
+        h = _make_action_handler(
+            starter=starter,
+            start_spec=_make_start_spec(tmp_path),
+            runtime_dir=tmp_path / "runtime",
+        )
+        out, succeeded = h.start(
+            DesiredStateSnapshot(action="start", model_id="bge-m3", enabled=True),
+            ActualStateSnapshot(),
+        )
+        assert succeeded is True  # start 接管成功可 ack
         assert out.running is True
-        assert out.warming_up is True
-        assert out.last_error == "warmup timeout"
+        assert out.warming_up is True  # self_heal 后续消化
+        assert out.pid == 1111  # 活 handle 的 pid
+        assert "warmup timeout" in out.last_error
+        assert h.current_handle is not None  # 保留活 handle
 
     def test_adopts_existing_pid_skips_spawn(self, tmp_path):
         starter = _StubStarter()
@@ -1478,11 +1893,248 @@ class TestEmbeddingActionHandlerStart:
             start_spec=_make_start_spec(tmp_path),
             runtime_dir=tmp_path / "runtime",
         )
-        out = h.start(DesiredStateSnapshot(action="start", model_id="bge-m3", enabled=True), ActualStateSnapshot())
+        out, succeeded = h.start(DesiredStateSnapshot(action="start", model_id="bge-m3", enabled=True), ActualStateSnapshot())
+        assert succeeded is True  # v2: adopt 成功可 ack
         assert starter.calls == [], "adopt 时不应 spawn 新进程"
         assert out.running is True
         assert out.pid == 5555
         assert out.warming_up is False
+
+    def test_adopt_during_quit_force_kills_before_clearing_hints(
+        self, monkeypatch, tmp_path,
+    ):
+        """shutdown 已错过 handle 时，adopt 分支必须直接 force-kill 后才清归属。"""
+        import embedding_process_manager as manager_module
+
+        runtime_dir = tmp_path / "runtime"
+        runtime_dir.mkdir()
+        (runtime_dir / "pid").write_text("5555", encoding="ascii")
+        (runtime_dir / "port").write_text("7687", encoding="ascii")
+
+        class FakeAdoptedHandle:
+            pid = 5555
+
+            def __init__(self) -> None:
+                self.alive = True
+                self.terminate_calls = 0
+                self.kill_calls = 0
+
+            def poll(self):
+                return None if self.alive else -9
+
+            def terminate(self):
+                self.terminate_calls += 1
+
+            def kill(self):
+                self.kill_calls += 1
+                self.alive = False
+                return True
+
+        adopted = FakeAdoptedHandle()
+        monkeypatch.setattr(
+            manager_module, "_AdoptedHandle", lambda **_kwargs: adopted,
+        )
+        monkeypatch.setattr(manager_module.time, "sleep", lambda _seconds: None)
+
+        handler = _make_action_handler(
+            cleaner=_StubResidue(adopt_pid=5555, stale_port=7687),
+            start_spec=_make_start_spec(tmp_path),
+            runtime_dir=runtime_dir,
+        )
+        stop_event = threading.Event()
+        stop_event.set()
+        handler.bind_lifecycle_hooks(
+            stop_event=stop_event, publish_interim=lambda _snapshot: None,
+        )
+
+        out, succeeded = handler.start(
+            DesiredStateSnapshot(action="start", model_id="bge-m3", enabled=True),
+            ActualStateSnapshot(),
+        )
+
+        assert succeeded is False
+        assert adopted.kill_calls == 1
+        assert adopted.terminate_calls == 0
+        assert handler.current_handle is None
+        assert not (runtime_dir / "pid").exists()
+        assert not (runtime_dir / "port").exists()
+        assert out.running is False
+        assert out.pid is None
+
+    def test_adopt_during_quit_kill_failure_preserves_ownership_hints(
+        self, monkeypatch, tmp_path,
+    ):
+        """force-kill 后进程仍活时不得删除下次启动所需的 PID/port。"""
+        import embedding_process_manager as manager_module
+
+        runtime_dir = tmp_path / "runtime"
+        runtime_dir.mkdir()
+        (runtime_dir / "pid").write_text("5555", encoding="ascii")
+        (runtime_dir / "port").write_text("7687", encoding="ascii")
+
+        class LiveAdoptedHandle:
+            pid = 5555
+
+            def __init__(self) -> None:
+                self.kill_calls = 0
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                raise AssertionError("quit race 不应先走 graceful terminate")
+
+            def kill(self):
+                self.kill_calls += 1
+                return False
+
+        adopted = LiveAdoptedHandle()
+        monkeypatch.setattr(
+            manager_module, "_AdoptedHandle", lambda **_kwargs: adopted,
+        )
+        monkeypatch.setattr(manager_module.time, "sleep", lambda _seconds: None)
+
+        handler = _make_action_handler(
+            cleaner=_StubResidue(adopt_pid=5555, stale_port=7687),
+            start_spec=_make_start_spec(tmp_path),
+            runtime_dir=runtime_dir,
+        )
+        stop_event = threading.Event()
+        stop_event.set()
+        handler.bind_lifecycle_hooks(
+            stop_event=stop_event, publish_interim=lambda _snapshot: None,
+        )
+
+        out, succeeded = handler.start(
+            DesiredStateSnapshot(action="start", model_id="bge-m3", enabled=True),
+            ActualStateSnapshot(),
+        )
+
+        assert succeeded is False
+        assert adopted.kill_calls == 1
+        assert handler.current_handle is adopted
+        assert (runtime_dir / "pid").read_text(encoding="ascii") == "5555"
+        assert (runtime_dir / "port").read_text(encoding="ascii") == "7687"
+        assert out.running is True
+        assert out.pid == 5555
+        assert "still alive" in out.last_error
+
+    def test_adopt_quit_race_keeps_local_handle_when_shutdown_steals_slot(
+        self, monkeypatch, tmp_path,
+    ):
+        """shutdown 清共享槽不等于进程已停；adopt 分支仍须验证自己的 handle。"""
+        import embedding_process_manager as manager_module
+
+        runtime_dir = tmp_path / "runtime"
+        runtime_dir.mkdir()
+        (runtime_dir / "pid").write_text("5555", encoding="ascii")
+        (runtime_dir / "port").write_text("7687", encoding="ascii")
+
+        class LiveAdoptedHandle:
+            pid = 5555
+
+            def __init__(self) -> None:
+                self.kill_calls = 0
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                raise AssertionError("quit race 不应先走 graceful terminate")
+
+            def kill(self):
+                self.kill_calls += 1
+                return False
+
+        adopted = LiveAdoptedHandle()
+        monkeypatch.setattr(
+            manager_module, "_AdoptedHandle", lambda **_kwargs: adopted,
+        )
+        monkeypatch.setattr(manager_module.time, "sleep", lambda _seconds: None)
+
+        handler = _make_action_handler(
+            cleaner=_StubResidue(adopt_pid=5555, stale_port=7687),
+            start_spec=_make_start_spec(tmp_path),
+            runtime_dir=runtime_dir,
+        )
+
+        def simulate_concurrent_shutdown() -> bool:
+            with handler._lock:  # noqa: SLF001
+                handler._current_handle = None  # noqa: SLF001
+            return True
+
+        monkeypatch.setattr(handler, "_is_stopping", simulate_concurrent_shutdown)
+
+        out, succeeded = handler.start(
+            DesiredStateSnapshot(action="start", model_id="bge-m3", enabled=True),
+            ActualStateSnapshot(),
+        )
+
+        assert succeeded is False
+        assert adopted.kill_calls == 1
+        assert handler.current_handle is adopted
+        assert (runtime_dir / "pid").exists()
+        assert (runtime_dir / "port").exists()
+        assert out.running is True
+        assert out.pid == 5555
+
+    def test_adopt_quit_does_not_treat_unknown_poll_as_confirmed_dead(
+        self, monkeypatch, tmp_path,
+    ):
+        """kill 未送达时，ownership probe 读空导致的 poll=-1 不是死亡证据。"""
+        import embedding_process_manager as manager_module
+
+        runtime_dir = tmp_path / "runtime"
+        runtime_dir.mkdir()
+        (runtime_dir / "pid").write_text("5555", encoding="ascii")
+        (runtime_dir / "port").write_text("7687", encoding="ascii")
+
+        class UnknownAfterFailedKill:
+            pid = 5555
+
+            def __init__(self) -> None:
+                self.kill_calls = 0
+
+            def poll(self):
+                # _AdoptedHandle 当前会在 cmdline probe 失败时这样返回；这并不
+                # 能证明 OS 进程已经退出。
+                return -1
+
+            def terminate(self):
+                raise AssertionError("quit race 不应先走 graceful terminate")
+
+            def kill(self):
+                self.kill_calls += 1
+                return False
+
+        adopted = UnknownAfterFailedKill()
+        monkeypatch.setattr(
+            manager_module, "_AdoptedHandle", lambda **_kwargs: adopted,
+        )
+
+        handler = _make_action_handler(
+            cleaner=_StubResidue(adopt_pid=5555, stale_port=7687),
+            start_spec=_make_start_spec(tmp_path),
+            runtime_dir=runtime_dir,
+        )
+        stop_event = threading.Event()
+        stop_event.set()
+        handler.bind_lifecycle_hooks(
+            stop_event=stop_event, publish_interim=lambda _snapshot: None,
+        )
+
+        out, succeeded = handler.start(
+            DesiredStateSnapshot(action="start", model_id="bge-m3", enabled=True),
+            ActualStateSnapshot(),
+        )
+
+        assert succeeded is False
+        assert adopted.kill_calls == 1
+        assert handler.current_handle is adopted
+        assert (runtime_dir / "pid").exists()
+        assert (runtime_dir / "port").exists()
+        assert out.running is True
+        assert out.pid == 5555
 
     def test_spawn_failure_sets_error(self, tmp_path):
         starter = _StubStarter()
@@ -1494,7 +2146,8 @@ class TestEmbeddingActionHandlerStart:
             start_spec=_make_start_spec(tmp_path),
             runtime_dir=tmp_path / "runtime",
         )
-        out = h.start(DesiredStateSnapshot(action="start", model_id="bge-m3", enabled=True), ActualStateSnapshot())
+        out, succeeded = h.start(DesiredStateSnapshot(action="start", model_id="bge-m3", enabled=True), ActualStateSnapshot())
+        assert succeeded is False  # v2: spawn 早夭是业务失败, 下轮同 generation 重试
         assert out.running is False
         assert "spawn failed" in out.last_error
         assert h.current_handle is None
@@ -1503,7 +2156,8 @@ class TestEmbeddingActionHandlerStart:
 class TestEmbeddingActionHandlerStop:
     def test_stop_when_no_handle_is_noop(self, tmp_path):
         h = _make_action_handler(runtime_dir=tmp_path / "runtime")
-        out = h.stop(DesiredStateSnapshot(action="stop"), ActualStateSnapshot(running=True))
+        out, succeeded = h.stop(DesiredStateSnapshot(action="stop"), ActualStateSnapshot(running=True))
+        assert succeeded is True  # v2: 幂等 stop 成功
         assert out.running is False
         assert out.pid is None
 
@@ -1519,7 +2173,8 @@ class TestEmbeddingActionHandlerStop:
         h.start(DesiredStateSnapshot(action="start", model_id="bge-m3", enabled=True), ActualStateSnapshot())
         assert h.current_handle is not None
 
-        out = h.stop(DesiredStateSnapshot(action="stop"), ActualStateSnapshot(running=True))
+        out, succeeded = h.stop(DesiredStateSnapshot(action="stop"), ActualStateSnapshot(running=True))
+        assert succeeded is True  # v2: graceful stop 成功可 ack
         assert out.running is False
         assert h.current_handle is None
         assert stopper.calls and stopper.calls[0][1] == tmp_path / "runtime"
@@ -1535,8 +2190,268 @@ class TestEmbeddingActionHandlerStop:
             runtime_dir=tmp_path / "runtime",
         )
         h.start(DesiredStateSnapshot(action="start", model_id="bge-m3", enabled=True), ActualStateSnapshot())
-        out = h.stop(DesiredStateSnapshot(action="stop"), ActualStateSnapshot(running=True))
+        out, succeeded = h.stop(DesiredStateSnapshot(action="stop"), ActualStateSnapshot(running=True))
+        assert succeeded is True  # v2: force-killed 也算成功停止
         assert "force-killed" in out.last_error
+
+    def test_stop_hard_failure_retains_handle_for_retry(self, tmp_path):
+        """M#2 + v2 P1-1: SIGKILL 也没生效 → err 非空 → 保留 handle 供下轮 stop 重试,
+        不 ack 假的"已停止"; 对齐 Mac ``StopResult`` retention。"""
+        starter = _StubStarter()
+        stopper = _StubStopper()
+        stopper.graceful = False
+        stopper.err = "process did not respond to SIGKILL"
+        h = _make_action_handler(
+            starter=starter, stopper=stopper,
+            start_spec=_make_start_spec(tmp_path),
+            runtime_dir=tmp_path / "runtime",
+        )
+        h.start(
+            DesiredStateSnapshot(action="start", model_id="bge-m3", enabled=True),
+            ActualStateSnapshot(),
+        )
+        assert h.current_handle is not None
+        out, succeeded = h.stop(
+            DesiredStateSnapshot(action="stop"),
+            ActualStateSnapshot(running=True),
+        )
+        # handle 应被保留 (下轮 tick 会重试), succeeded=False (未成功停止)
+        assert succeeded is False  # v2: 未成功停止, 不 ack, 下轮重试
+        assert h.current_handle is not None, "stop hard failure 时不许清 live handle"
+        assert out.running is True
+        assert out.pid == 1111
+        assert "SIGKILL" in out.last_error
+
+    def test_stop_hard_failure_never_acks_live_process_as_stopped(self, tmp_path):
+        """SIGKILL 连续失败仍保留 handle，并靠 tick backoff 限流。
+
+        对齐已验证的 Mac doStop：只要进程仍活，就不能伪装 stopped 或 ack stop。
+        """
+        starter = _StubStarter()
+        stopper = _StubStopper()
+        stopper.graceful = False
+        stopper.err = "process did not respond to SIGKILL"
+        h = _make_action_handler(
+            starter=starter, stopper=stopper,
+            start_spec=_make_start_spec(tmp_path),
+            runtime_dir=tmp_path / "runtime",
+        )
+        h.start(
+            DesiredStateSnapshot(action="start", model_id="bge-m3", enabled=True),
+            ActualStateSnapshot(),
+        )
+        for _ in range(4):
+            out, succeeded = h.stop(
+                DesiredStateSnapshot(action="stop"),
+                ActualStateSnapshot(running=True),
+            )
+        assert h.current_handle is not None
+        assert succeeded is False
+        assert out.running is True
+        assert "SIGKILL" in out.last_error
+        assert out.pid == 1111
+
+
+class TestCmdlineOptionMatches:
+    """G4: --port 7687 正则边界防 --port 76870 误匹配。"""
+
+    @staticmethod
+    def _match(cmdline, name, value):
+        from embedding_process_manager import _cmdline_option_matches
+        return _cmdline_option_matches(cmdline, name, value)
+
+    def test_exact_match_with_space(self):
+        assert self._match("infinity --port 7687 --model-id bge", "--port", "7687")
+
+    def test_exact_match_with_equal(self):
+        assert self._match("infinity --port=7687 --model-id=bge", "--port", "7687")
+
+    def test_boundary_rejects_prefix_extension(self):
+        """--port 76870 不应匹配 --port 7687。"""
+        assert not self._match("infinity --port 76870 --model-id bge", "--port", "7687")
+
+    def test_boundary_rejects_suffix_prefix(self):
+        """--porter 7687 不应匹配 --port 7687(name 边界)。"""
+        assert not self._match("infinity --porter 7687", "--port", "7687")
+
+    def test_empty_cmdline_returns_false(self):
+        assert not self._match("", "--port", "7687")
+
+    def test_end_of_string_ok(self):
+        """值在末尾时 (?=\\s|$) 应命中。"""
+        assert self._match("infinity --port 7687", "--port", "7687")
+
+
+class TestOwnedInfinityCmdlineMatches:
+    """G4+N5 融合: cmdline 联合校验 model_id + port,不是 substring。"""
+
+    @staticmethod
+    def _match(cmdline, model_id, port):
+        from embedding_process_manager import _owned_infinity_cmdline_matches
+        return _owned_infinity_cmdline_matches(cmdline, model_id, port)
+
+    def test_full_match(self):
+        assert self._match(
+            "/venv/python -m infinity_emb v2 --port 7687 --model-id bge-m3",
+            "bge-m3", 7687,
+        )
+
+    def test_wrong_port_rejected(self):
+        assert not self._match(
+            "/venv/python -m infinity_emb v2 --port 7688 --model-id bge-m3",
+            "bge-m3", 7687,
+        )
+
+    def test_no_infinity_keyword_rejected(self):
+        """非 infinity 进程(比如 tray python) 直接拒绝。"""
+        assert not self._match(
+            "python tray_app.py --port 7687 --model-id bge-m3",
+            "bge-m3", 7687,
+        )
+
+    def test_port_prefix_boundary(self):
+        assert not self._match(
+            "infinity_emb --port 76870 --model-id bge-m3",
+            "bge-m3", 7687,
+        )
+
+
+class TestAdoptedHandleOwnershipVerify:
+    """N5: _AdoptedHandle poll/terminate/kill 每次都校验 cmdline 匹配。"""
+
+    def _make_handle(self, pid, model_id, port, cmdline):
+        """构造带 fake cmdline probe 的 _AdoptedHandle。"""
+        from embedding_process_manager import _AdoptedHandle
+
+        class _FakeCmdlineProbe:
+            def cmdline(self, _pid):
+                return cmdline
+
+        return _AdoptedHandle(
+            pid=pid,
+            expected_model_id=model_id,
+            expected_port=port,
+            cmdline_probe=_FakeCmdlineProbe(),
+        )
+
+    def test_poll_returns_dead_when_cmdline_no_longer_matches(self, monkeypatch):
+        """PID 存活但 cmdline 变了(PID 复用) → poll 应返 -1 装死。"""
+        import embedding_process_manager as m
+        monkeypatch.setattr(m, "_pid_alive", lambda _pid: True)
+        h = self._make_handle(
+            pid=99999,
+            model_id="bge-m3",
+            port=7687,
+            cmdline="explorer.exe",  # 完全不匹配
+        )
+        assert h.poll() == -1
+
+    def test_poll_returns_alive_when_cmdline_matches(self, monkeypatch):
+        import embedding_process_manager as m
+        monkeypatch.setattr(m, "_pid_alive", lambda _pid: True)
+        h = self._make_handle(
+            pid=99999,
+            model_id="bge-m3",
+            port=7687,
+            cmdline="python -m infinity_emb --port 7687 --model-id bge-m3",
+        )
+        assert h.poll() is None
+
+    def test_poll_treats_empty_cmdline_probe_as_unknown_not_dead(self, monkeypatch):
+        """PID 明确存活但 owner query 临时读空时，必须保守保留归属。"""
+        import embedding_process_manager as m
+
+        monkeypatch.setattr(m, "_pid_alive", lambda _pid: True)
+        h = self._make_handle(
+            pid=99999, model_id="bge-m3", port=7687, cmdline="",
+        )
+        assert h.poll() is None
+
+    def test_terminate_skips_when_cmdline_stranger(self, monkeypatch):
+        """cmdline 是外人 → terminate 不发信号,防误杀。"""
+        import embedding_process_manager as m
+        monkeypatch.setattr(m, "_pid_alive", lambda _pid: True)
+        calls: list = []
+        # 拦截 subprocess.run 记录调用
+        monkeypatch.setattr(
+            "subprocess.run", lambda *a, **kw: calls.append(a) or None,
+        )
+        h = self._make_handle(
+            pid=99999,
+            model_id="bge-m3",
+            port=7687,
+            cmdline="notepad.exe hello.txt",
+        )
+        h.terminate()
+        assert calls == [], "cmdline 校验失败时不应 spawn taskkill"
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Win-only: terminate() 在 Mac 走 posix kill 分支不调 subprocess.run(taskkill)",
+    )
+    def test_terminate_owned_process_has_finite_taskkill_timeout(self, monkeypatch):
+        import embedding_process_manager as m
+
+        monkeypatch.setattr(m, "_pid_alive", lambda _pid: True)
+        run = MagicMock(return_value=type("Completed", (), {"returncode": 0})())
+        monkeypatch.setattr(m.subprocess, "run", run)
+        h = self._make_handle(
+            pid=99999,
+            model_id="bge-m3",
+            port=7687,
+            cmdline="python -m infinity_emb --port 7687 --model-id bge-m3",
+        )
+
+        h.terminate()
+
+        assert run.call_args.kwargs["timeout"] == 5.0
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Win-only: kill() 在 Mac 走 posix kill 分支不调 subprocess.run(taskkill)",
+    )
+    def test_kill_returns_true_only_when_force_signal_was_delivered(self, monkeypatch):
+        import embedding_process_manager as m
+
+        monkeypatch.setattr(m, "_pid_alive", lambda _pid: True)
+        completed = type("Completed", (), {"returncode": 0})()
+        run = MagicMock(return_value=completed)
+        monkeypatch.setattr(m.subprocess, "run", run)
+        h = self._make_handle(
+            pid=99999,
+            model_id="bge-m3",
+            port=7687,
+            cmdline="python -m infinity_emb --port 7687 --model-id bge-m3",
+        )
+
+        assert h.kill() is True
+        run.assert_called_once()
+
+    def test_kill_returns_false_when_ownership_probe_is_unknown(self, monkeypatch):
+        import embedding_process_manager as m
+
+        monkeypatch.setattr(m, "_pid_alive", lambda _pid: True)
+        run = MagicMock()
+        monkeypatch.setattr(m.subprocess, "run", run)
+        h = self._make_handle(
+            pid=99999, model_id="bge-m3", port=7687, cmdline="",
+        )
+
+        assert h.kill() is False
+        run.assert_not_called()
+
+    def test_kill_treats_already_dead_pid_as_success(self, monkeypatch):
+        import embedding_process_manager as m
+
+        monkeypatch.setattr(m, "_pid_alive", lambda _pid: False)
+        run = MagicMock()
+        monkeypatch.setattr(m.subprocess, "run", run)
+        h = self._make_handle(
+            pid=99999, model_id="bge-m3", port=7687, cmdline="",
+        )
+
+        assert h.kill() is True
+        run.assert_not_called()
 
 
 class TestEmbeddingActionHandlerSwitchModel:
@@ -1555,7 +2470,8 @@ class TestEmbeddingActionHandlerSwitchModel:
         starter.calls.clear()  # 重置计数,关注 switch 内的 start
 
         desired = DesiredStateSnapshot(action="switch_model", model_id="new", enabled=True, generation=5)
-        out = h.switch_model(desired, ActualStateSnapshot(running=True))
+        out, succeeded = h.switch_model(desired, ActualStateSnapshot(running=True))
+        assert succeeded is True  # v2: 三步全成功
         assert len(stopper.calls) == 1
         assert len(installer.calls) == 1
         assert len(starter.calls) == 1
@@ -1571,7 +2487,8 @@ class TestEmbeddingActionHandlerSwitchModel:
             start_spec=_make_start_spec(tmp_path),
             runtime_dir=tmp_path / "runtime",
         )
-        out = h.switch_model(DesiredStateSnapshot(action="switch_model", model_id="new"), ActualStateSnapshot())
+        out, succeeded = h.switch_model(DesiredStateSnapshot(action="switch_model", model_id="new"), ActualStateSnapshot())
+        assert succeeded is False  # v2: install 失败, switch 整体失败, 不 ack
         assert installer.calls
         assert starter.calls == []  # install 失败,start 不应被调
         assert out.installed is False

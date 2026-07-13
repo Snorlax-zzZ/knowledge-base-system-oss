@@ -505,6 +505,18 @@ body.theme-neo .ask-answer-rendered {
 }
 body.theme-neo .ask-answer-rendered code { background: rgba(255, 255, 255, 0.08); }
 
+.ask-answer-warning {
+  margin: -4px 0 16px;
+  padding: 10px 12px;
+  border: 1px solid #f59e0b;
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.12);
+  color: #92400e;
+  font-size: 13px;
+  line-height: 1.5;
+}
+body.theme-neo .ask-answer-warning { color: #fcd34d; }
+
 .ask-chunks-rendered { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
 .ask-citation {
   border: 1px solid #e2e8f0;

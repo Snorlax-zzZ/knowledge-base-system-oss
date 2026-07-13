@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import BinaryIO
 
 # PyInstaller --onefile 解压到临时目录，Windows 默认不搜索该目录的 DLL
 # 必须在任何可能触发 _ctypes 的 import 之前注册
@@ -11,6 +12,8 @@ if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
     if hasattr(os, "add_dll_directory"):
         os.add_dll_directory(sys._MEIPASS)
     os.environ["PATH"] = sys._MEIPASS + os.pathsep + os.environ.get("PATH", "")
+
+import portalocker  # noqa: E402 — frozen DLL path must be registered first
 
 # PyInstaller --noconsole 模式下 sys.stdout/stderr 为 None
 # uvicorn DefaultFormatter.__init__ 会调用 stream.isatty() 导致 AttributeError
@@ -49,6 +52,26 @@ def _load_config(root: Path) -> dict:
         with open(cfg_path, "rb") as f:
             return tomllib.load(f)
     return {}
+
+
+def _acquire_process_lock(root: Path) -> BinaryIO | None:
+    """Try to become the sole kb-api process for this install root."""
+    runtime_dir = root / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    handle = (runtime_dir / "kb-api-process.lock").open("a+b")
+    try:
+        portalocker.lock(handle, portalocker.LOCK_EX | portalocker.LOCK_NB)
+    except portalocker.exceptions.LockException:
+        handle.close()
+        return None
+    return handle
+
+
+def _release_process_lock(handle: BinaryIO) -> None:
+    try:
+        portalocker.unlock(handle)
+    finally:
+        handle.close()
 
 
 def _write_dependency_probe(log_path: Path) -> None:
@@ -116,45 +139,58 @@ def _write_dependency_probe(log_path: Path) -> None:
 
 def main() -> None:
     root = _install_root()
-    cfg = _load_config(root)
-    # 方案 4：frozen 冷启动早期 probe qdrant_client + 关键传递依赖，落 log
-    # 让用户一启动就有依赖状态证据，不用等 rebuild 才触发才能看到 import 失败。
-    _write_dependency_probe(root / "logs" / "qdrant-import-probe.log")
+    # 必须早于 dependency probe 和 app.main import：直接双击/绕过 shell 并发
+    # 启动时，loser 在 FastAPI startup 写 owner_token 之前就干净退出。
+    process_lock = _acquire_process_lock(root)
+    if process_lock is None:
+        print(
+            "[server-entry] another kb-api process is already running; exiting",
+            file=sys.stderr,
+        )
+        return
 
-    # 构建机 pre-ship 自测入口（build_direct_install.ps1 里 setenv KB_PROBE_ONLY=1
-    # 起一次 kb-api.exe → probe 落盘 → 立即退出）。生产不会设这个 env。
-    if os.environ.get("KB_PROBE_ONLY") == "1":
-        print("[server-entry] KB_PROBE_ONLY=1, exited after probe")
-        sys.exit(0)
+    try:
+        cfg = _load_config(root)
+        # 方案 4：frozen 冷启动早期 probe qdrant_client + 关键传递依赖，落 log
+        # 让用户一启动就有依赖状态证据，不用等 rebuild 才触发才能看到 import 失败。
+        _write_dependency_probe(root / "logs" / "qdrant-import-probe.log")
 
-    server_cfg = cfg.get("server", {})
-    data_cfg = cfg.get("data", {})
+        # 构建机 pre-ship 自测入口（build_direct_install.ps1 里 setenv KB_PROBE_ONLY=1
+        # 起一次 kb-api.exe → probe 落盘 → 立即退出）。生产不会设这个 env。
+        if os.environ.get("KB_PROBE_ONLY") == "1":
+            print("[server-entry] KB_PROBE_ONLY=1, exited after probe")
+            sys.exit(0)
 
-    host: str = server_cfg.get("host", "127.0.0.1")
-    port: int = int(server_cfg.get("port", 18000))
+        server_cfg = cfg.get("server", {})
+        data_cfg = cfg.get("data", {})
 
-    sqlite_path = str(root / data_cfg.get("sqlite_path", "data/knowledge.db"))
-    qdrant_path = str(root / data_cfg.get("qdrant_local_path", "data/qdrant_local"))
-    vector_enabled = "1" if data_cfg.get("vector_enabled", True) else "0"
+        host: str = server_cfg.get("host", "127.0.0.1")
+        port: int = int(server_cfg.get("port", 18000))
 
-    os.environ.setdefault("KB_BACKEND", "sqlite")
-    os.environ["SQLITE_PATH"] = sqlite_path
-    os.environ["VECTOR_ENABLED"] = vector_enabled
-    os.environ["QDRANT_MODE"] = "local"
-    os.environ["QDRANT_LOCAL_PATH"] = qdrant_path
+        sqlite_path = str(root / data_cfg.get("sqlite_path", "data/knowledge.db"))
+        qdrant_path = str(root / data_cfg.get("qdrant_local_path", "data/qdrant_local"))
+        vector_enabled = "1" if data_cfg.get("vector_enabled", True) else "0"
 
-    print(f"[server-entry] KB_BACKEND={os.environ.get('KB_BACKEND', 'sqlite')}")
-    print(f"[server-entry] PORT={port} (source=config.toml)")
-    print(f"[server-entry] SQLITE_PATH={sqlite_path}")
+        os.environ.setdefault("KB_BACKEND", "sqlite")
+        os.environ["SQLITE_PATH"] = sqlite_path
+        os.environ["VECTOR_ENABLED"] = vector_enabled
+        os.environ["QDRANT_MODE"] = "local"
+        os.environ["QDRANT_LOCAL_PATH"] = qdrant_path
 
-    # 确保数据目录存在
-    Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(qdrant_path).mkdir(parents=True, exist_ok=True)
+        print(f"[server-entry] KB_BACKEND={os.environ.get('KB_BACKEND', 'sqlite')}")
+        print(f"[server-entry] PORT={port} (source=config.toml)")
+        print(f"[server-entry] SQLITE_PATH={sqlite_path}")
 
-    import uvicorn
-    from app.main import app as fastapi_app  # noqa: F401
+        # 确保数据目录存在
+        Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(qdrant_path).mkdir(parents=True, exist_ok=True)
 
-    uvicorn.run(fastapi_app, host=host, port=port, workers=1)
+        import uvicorn
+        from app.main import app as fastapi_app  # noqa: F401
+
+        uvicorn.run(fastapi_app, host=host, port=port, workers=1)
+    finally:
+        _release_process_lock(process_lock)
 
 
 if __name__ == "__main__":

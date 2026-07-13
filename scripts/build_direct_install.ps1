@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "1.3.12"
+    [string]$Version = "1.3.13"
 )
 
 Set-StrictMode -Version Latest
@@ -14,8 +14,30 @@ if (-not (Test-Path $VenvPython)) {
     exit 1
 }
 
-# 写入 VERSION 文件 — 与 mac dmg 流程一致，供 app/main.py 启动时读为 APP_VERSION
-Set-Content -Path "$RootDir\VERSION" -Value $Version -NoNewline -Encoding utf8
+function Test-OpenSslRuntimeBundle {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BundleDir
+    )
+
+    foreach ($DllName in @("libcrypto-3-x64.dll", "libssl-3-x64.dll")) {
+        $BundledDll = Join-Path $BundleDir "_internal\$DllName"
+        if (-not (Test-Path -LiteralPath $BundledDll)) {
+            Write-Error "打包产物缺少 Python SSL 运行时：$BundledDll"
+            return $false
+        }
+    }
+    return $true
+}
+
+# VERSION 文件已改为 git 追踪 (v1.3.13 决策), ps1 不再覆盖源码根 VERSION。
+# 校验四处版本号一致 (VERSION + ps1 -Version default + installer.iss AppVersion + dmg.sh VERSION)。
+# 不一致 → 拒 build 防版本漂移。tests/test_release_contract 会兜底,build 前拦一次。
+$SourceVersion = (Get-Content -Raw -LiteralPath "$RootDir\VERSION").Trim()
+if ($SourceVersion -ne $Version) {
+    Write-Error "VERSION 源码文件 ($SourceVersion) 与 -Version 参数 ($Version) 不一致; 请 bump 四处版本再打包"
+    exit 1
+}
 Write-Host "=== 版本: $Version ===" -ForegroundColor Cyan
 
 New-Item -ItemType Directory -Force -Path "$RootDir\bin" | Out-Null
@@ -57,11 +79,16 @@ $AnacondaDll = "E:\anaconda\Library\bin"
     --add-binary "$AnacondaDll\libbz2.dll;." `
     --add-binary "$AnacondaDll\liblzma.dll;." `
     --add-binary "$AnacondaDll\libmpdec-4.dll;." `
+    --add-binary "$AnacondaDll\libcrypto-3-x64.dll;." `
+    --add-binary "$AnacondaDll\libssl-3-x64.dll;." `
     --noconsole `
     "$RootDir\app\server_entry.py"
 
 if ($LASTEXITCODE -ne 0) {
     Write-Error "kb-api.exe 构建失败（exit $LASTEXITCODE）"
+    exit 1
+}
+if (-not (Test-OpenSslRuntimeBundle -BundleDir "$RootDir\bin\kb-api")) {
     exit 1
 }
 
@@ -145,10 +172,15 @@ $AnacondaLib = "E:\anaconda\Library\lib"
     --add-binary "$AnacondaDll\libbz2.dll;." `
     --add-binary "$AnacondaDll\liblzma.dll;." `
     --add-binary "$AnacondaDll\libmpdec-4.dll;." `
+    --add-binary "$AnacondaDll\libcrypto-3-x64.dll;." `
+    --add-binary "$AnacondaDll\libssl-3-x64.dll;." `
     "$RootDir\windows-app\tray_app_local.py"
 
 if ($LASTEXITCODE -ne 0) {
     Write-Error "kb-tray.exe 构建失败（exit $LASTEXITCODE）"
+    exit 1
+}
+if (-not (Test-OpenSslRuntimeBundle -BundleDir "$RootDir\bin\kb-tray")) {
     exit 1
 }
 
@@ -157,15 +189,26 @@ Write-Host "=== 构建安装包 ===" -ForegroundColor Cyan
 
 $InnoSetup = "E:\Inno Setup 6\ISCC.exe"
 if (-not (Test-Path $InnoSetup)) {
-    Write-Warning "找不到 Inno Setup：$InnoSetup，跳过安装包构建"
+    Write-Error "找不到 Inno Setup：$InnoSetup，无法生成发布安装包"
+    exit 1
 } else {
+    $InstallerBuildStarted = Get-Date
     New-Item -ItemType Directory -Force -Path "$RootDir\dist" | Out-Null
     & $InnoSetup "/DAppVersion=$Version" "$RootDir\scripts\installer.iss"
     if ($LASTEXITCODE -ne 0) {
         Write-Error "安装包构建失败（exit $LASTEXITCODE）"
         exit 1
     }
-    Write-Host "  dist\KnowledgeBase-Setup-*.exe"
+    $InstallerPath = "$RootDir\dist\KnowledgeBase-Setup-$Version.exe"
+    if (-not (Test-Path -LiteralPath $InstallerPath)) {
+        Write-Error "安装包构建命令成功，但产物不存在：$InstallerPath"
+        exit 1
+    }
+    if ((Get-Item -LiteralPath $InstallerPath).LastWriteTime -lt $InstallerBuildStarted) {
+        Write-Error "安装包不是本轮构建生成的最新产物：$InstallerPath"
+        exit 1
+    }
+    Write-Host "  $InstallerPath"
 }
 
 # ── 完成 ──────────────────────────────────────────────────────────────────────

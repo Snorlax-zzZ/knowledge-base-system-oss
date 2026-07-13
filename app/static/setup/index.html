@@ -248,7 +248,11 @@
       setStatus("choose-status", "", "");
       if (mode === "skip") {
         // mode=disabled,直接跳 /console
-        const r = await apiJson("PUT", "/v1/system/config", { embedding_service_mode: "disabled" });
+        const r = await apiJson("PUT", "/v1/system/config", {
+          embedding_service_mode: "disabled",
+          embedding_enabled: false,
+          confirm_reindex: "I-CONFIRM-REINDEX",
+        });
         if (r.ok) {
           window.location.href = "/console";
         } else {
@@ -336,9 +340,11 @@
       setStatus("external-status", "保存中...", "");
       const r = await apiJson("PUT", "/v1/system/config", {
         embedding_service_mode: "external",
+        embedding_enabled: true,
         embedding_base_url: baseUrl,
         embedding_model: model,
         embedding_api_key: apiKey,
+        confirm_reindex: "I-CONFIRM-REINDEX",
       });
       if (r.ok) {
         setStatus("external-status", "已保存,跳转中...", "ok");

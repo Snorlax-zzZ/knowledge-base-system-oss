@@ -132,6 +132,7 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                     llm_timeout_sec REAL NOT NULL DEFAULT 30.0,
                     llm_temperature REAL NOT NULL DEFAULT 0.2,
                     llm_max_tokens INTEGER NOT NULL DEFAULT 1024,
+                    llm_max_tokens_auto INTEGER NOT NULL DEFAULT 1,
                     embedding_enabled INTEGER NOT NULL DEFAULT 0,
                     embedding_api_key TEXT NOT NULL DEFAULT '',
                     embedding_base_url TEXT NOT NULL DEFAULT '',
@@ -182,6 +183,9 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                 conn.execute("ALTER TABLE system_config ADD COLUMN llm_temperature REAL NOT NULL DEFAULT 0.2")
             with contextlib.suppress(Exception):
                 conn.execute("ALTER TABLE system_config ADD COLUMN llm_max_tokens INTEGER NOT NULL DEFAULT 1024")
+            # 升级库必须继续使用旧的显式 Token 限制；新库由 CREATE 默认 auto=1。
+            with contextlib.suppress(Exception):
+                conn.execute("ALTER TABLE system_config ADD COLUMN llm_max_tokens_auto INTEGER NOT NULL DEFAULT 0")
             with contextlib.suppress(Exception):
                 conn.execute("ALTER TABLE system_config ADD COLUMN embedding_enabled INTEGER NOT NULL DEFAULT 0")
             with contextlib.suppress(Exception):
@@ -231,6 +235,15 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                     "ALTER TABLE system_config ADD COLUMN embedding_service_cuda_version"
                     " TEXT NOT NULL DEFAULT 'cu124'"
                 )
+            # managed 是 mode 的派生持久化值。双向修复历史脏组合，并用 WHERE
+            # 保证重复初始化不会产生无意义写入（备份恢复后 reset_schema 也会执行）。
+            conn.execute(
+                "UPDATE system_config "
+                "SET embedding_service_managed = "
+                "CASE WHEN embedding_service_mode = 'local' THEN 1 ELSE 0 END "
+                "WHERE embedding_service_managed != "
+                "CASE WHEN embedding_service_mode = 'local' THEN 1 ELSE 0 END"
+            )
 
     @staticmethod
     def _dt_str(dt: datetime | None) -> str | None:
@@ -969,11 +982,23 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
             ):
                 conn.execute(f"DELETE FROM {table}")
 
+    def has_system_config(self) -> bool:
+        """是否已经保存过系统设置。
+
+        ``get_system_config`` 在无记录时仍需为设置页返回完整默认值，因此调用方
+        不能靠字典是否为空判断 DB / 环境变量优先级。
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM system_config WHERE id = 1"
+            ).fetchone()
+        return row is not None
+
     def get_system_config(self) -> dict[str, Any]:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT api_base_url, service_port, grafana_url, ui_theme,"
-                " llm_enabled, llm_api_key, llm_base_url, llm_model, llm_timeout_sec, llm_temperature, llm_max_tokens,"
+                " llm_enabled, llm_api_key, llm_base_url, llm_model, llm_timeout_sec, llm_temperature, llm_max_tokens, llm_max_tokens_auto,"
                 " embedding_enabled, embedding_api_key, embedding_base_url, embedding_model, embedding_dim, embedding_timeout_sec,"
                 " rerank_enabled, rerank_api_key, rerank_base_url, rerank_model, rerank_path, rerank_timeout_sec,"
                 " enrichment_enabled,"
@@ -984,7 +1009,7 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
             ).fetchone()
             if row:
                 out = dict(row)
-                for k in ("llm_enabled", "embedding_enabled", "rerank_enabled", "enrichment_enabled",
+                for k in ("llm_enabled", "llm_max_tokens_auto", "embedding_enabled", "rerank_enabled", "enrichment_enabled",
                           "embedding_service_managed"):
                     out[k] = bool(out.get(k))
                 return out
@@ -1000,6 +1025,7 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                 "llm_timeout_sec": 30.0,
                 "llm_temperature": 0.2,
                 "llm_max_tokens": 1024,
+                "llm_max_tokens_auto": True,
                 "embedding_enabled": False,
                 "embedding_api_key": "",
                 "embedding_base_url": "",
@@ -1035,6 +1061,7 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
         llm_timeout_sec = float(payload.get("llm_timeout_sec") or 30.0)
         llm_temperature = float(payload.get("llm_temperature") or 0.2)
         llm_max_tokens = int(payload.get("llm_max_tokens") or 1024)
+        llm_max_tokens_auto = bool(payload.get("llm_max_tokens_auto", True))
         embedding_enabled = bool(payload.get("embedding_enabled", False))
         embedding_api_key = str(payload.get("embedding_api_key") or "").strip()
         embedding_base_url = str(payload.get("embedding_base_url") or "").strip().rstrip("/")
@@ -1054,7 +1081,9 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
         embedding_service_mode = str(payload.get("embedding_service_mode") or "disabled").strip().lower()
         if embedding_service_mode not in {"local", "external", "disabled"}:
             embedding_service_mode = "disabled"
-        embedding_service_managed = bool(payload.get("embedding_service_managed", False))
+        # repository 是 SQLite 最终写入边界；即使备份恢复、脚本或内部调用绕过
+        # API handler，也不能持久化与 mode 冲突的 managed 值。
+        embedding_service_managed = embedding_service_mode == "local"
         embedding_service_model_id = str(payload.get("embedding_service_model_id") or "").strip()
         embedding_service_port = int(payload.get("embedding_service_port") or 0)
         embedding_service_device = str(payload.get("embedding_service_device") or "cpu").strip().lower()
@@ -1090,7 +1119,7 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                 INSERT INTO system_config (
                   id, api_base_url, service_port, grafana_url, ui_theme,
                   llm_enabled, llm_api_key, llm_base_url, llm_model,
-                  llm_timeout_sec, llm_temperature, llm_max_tokens,
+                  llm_timeout_sec, llm_temperature, llm_max_tokens, llm_max_tokens_auto,
                   embedding_enabled, embedding_api_key, embedding_base_url, embedding_model, embedding_dim, embedding_timeout_sec,
                   rerank_enabled, rerank_api_key, rerank_base_url, rerank_model, rerank_path, rerank_timeout_sec,
                   enrichment_enabled,
@@ -1098,7 +1127,7 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                   embedding_service_port, embedding_service_device,
                   embedding_service_pytorch_mirror, embedding_service_cuda_version, updated_at
                 )
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                   api_base_url=excluded.api_base_url,
                   service_port=excluded.service_port,
@@ -1111,6 +1140,7 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                   llm_timeout_sec=excluded.llm_timeout_sec,
                   llm_temperature=excluded.llm_temperature,
                   llm_max_tokens=excluded.llm_max_tokens,
+                  llm_max_tokens_auto=excluded.llm_max_tokens_auto,
                   embedding_enabled=excluded.embedding_enabled,
                   embedding_api_key=excluded.embedding_api_key,
                   embedding_base_url=excluded.embedding_base_url,
@@ -1136,7 +1166,7 @@ class SqliteKnowledgeRepo(BaseKnowledgeRepo):
                 (
                     api_base_url, service_port, grafana_url, ui_theme,
                     1 if llm_enabled else 0, llm_api_key, llm_base_url, llm_model,
-                    llm_timeout_sec, llm_temperature, llm_max_tokens,
+                    llm_timeout_sec, llm_temperature, llm_max_tokens, 1 if llm_max_tokens_auto else 0,
                     1 if embedding_enabled else 0, embedding_api_key, embedding_base_url, embedding_model, embedding_dim, embedding_timeout_sec,
                     1 if rerank_enabled else 0, rerank_api_key, rerank_base_url, rerank_model, rerank_path, rerank_timeout_sec,
                     1 if enrichment_enabled else 0,

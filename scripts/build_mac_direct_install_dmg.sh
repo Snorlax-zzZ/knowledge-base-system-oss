@@ -17,7 +17,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
 BUILD_API=0
-VERSION="1.0.0"
+VERSION="1.3.13"
 
 if [[ "${1:-}" == "--build-api" ]]; then
   BUILD_API=1

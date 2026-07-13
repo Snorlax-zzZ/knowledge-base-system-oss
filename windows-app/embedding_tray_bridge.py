@@ -296,6 +296,7 @@ def make_default_spec_factory(data_root: Path) -> Callable[
             # 透传 plan.env（INFINITY_BETTERTRANSFORMER=false 等），缺这一步
             # infinity 启动撞 NameError(BetterTransformerManager) → exit 3
             env=dict(plan.env or {}),
+            cmdline_model_value=plan.model_dir,
         )
 
         return EmbeddingActionContext(

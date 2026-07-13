@@ -139,6 +139,8 @@ class AskResponse(BaseModel):
     answer: str | None = Field(default=None, description="LLM 生成的回答；LLM 未配置或调用失败时为 null。")
     llm_available: bool = Field(description="LLM 是否已配置并可用。")
     llm_error: str | None = Field(default=None, description="LLM 调用失败时的错误类型；成功时为 null。")
+    finish_reason: str | None = Field(default=None, description="供应商返回的生成停止原因。")
+    truncated: bool = Field(default=False, description="回答是否因达到输出长度上限而截断。")
     chunks_used: list[AskChunkRef] = Field(default_factory=list, description="实际喂给 LLM 的 chunk 来源列表。")
 
 
@@ -191,6 +193,7 @@ class SystemConfigResponse(BaseModel):
     llm_timeout_sec: float = Field(default=30.0)
     llm_temperature: float = Field(default=0.2)
     llm_max_tokens: int = Field(default=1024)
+    llm_max_tokens_auto: bool = Field(default=True)
     embedding_enabled: bool = Field(default=False)
     embedding_api_key: str = Field(default="")
     embedding_base_url: str = Field(default="")
@@ -219,9 +222,11 @@ class SystemConfigResponse(BaseModel):
 
 
 class SystemConfigUpsertRequest(BaseModel):
-    api_base_url: str = Field(min_length=1)
+    # 多个内置客户端只提交自己编辑的字段；默认值只负责让请求进入 handler，
+    # handler 会依据 model_fields_set 用数据库当前值补齐未显式提交的字段。
+    api_base_url: str = Field(default="http://127.0.0.1:18000", min_length=1)
     service_port: int = Field(default=18000, ge=1, le=65535)
-    grafana_url: str = Field(min_length=1)
+    grafana_url: str = Field(default="http://127.0.0.1:3000", min_length=1)
     ui_theme: str = Field(default="neo", pattern="^(linear|glass|neo)$")
     llm_enabled: bool = Field(default=False)
     llm_api_key: str = Field(default="")
@@ -230,6 +235,7 @@ class SystemConfigUpsertRequest(BaseModel):
     llm_timeout_sec: float = Field(default=30.0, ge=1, le=300)
     llm_temperature: float = Field(default=0.2, ge=0, le=2)
     llm_max_tokens: int = Field(default=1024, ge=1, le=8192)
+    llm_max_tokens_auto: bool = Field(default=True)
     embedding_enabled: bool = Field(default=False)
     embedding_api_key: str = Field(default="")
     embedding_base_url: str = Field(default="")
@@ -378,6 +384,9 @@ class EmbeddingServiceStartStopRequest(BaseModel):
     # prev / DB config",kb-api 端 3 级兜底。跨端一致(Win 传 cpu/cuda,Mac 传
     # cpu/mps/cuda 都命中此正则)。
     device: str = Field(default="", pattern="^(|cpu|cuda|mps)$")
+    # manager 的 repair install 完成后续接 start 时携带；服务端只在 desired
+    # 仍是该 generation 时接受，防用户较新的 stop 被旧 repair 回调覆盖。
+    expected_generation: int | None = Field(default=None, ge=0)
 
 
 class EmbeddingServiceInstallPlanResponse(BaseModel):

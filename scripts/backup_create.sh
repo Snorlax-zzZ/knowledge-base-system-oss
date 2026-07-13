@@ -6,7 +6,6 @@
 # app/services/knowledge_package.py:KnowledgePackageService.create_backup。
 # 生成的备份目录结构 (config/data/meta 三个子目录 + 3 字段 manifest) 跟 Python 版
 # 严格等语义, 双向互操作。
-# 详见 docs/_review_inputs/2026-07-02-tarball-format-audit.md。
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"

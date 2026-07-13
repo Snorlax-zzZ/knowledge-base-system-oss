@@ -13,6 +13,7 @@ ProcessManager）启动后读出来塞到 ``X-Embedding-Owner-Token`` header。
 from __future__ import annotations
 
 import os
+import socket
 import stat
 import sys
 from pathlib import Path
@@ -25,6 +26,13 @@ from app.services.embedding_service_state import (
     resolve_owner_token_path,
     write_owner_token_file,
 )
+
+
+def _unused_loopback_port() -> int:
+    """Return a currently unused loopback port for startup-hook tests."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +118,9 @@ class TestStartupHookPersistsToken:
         monkeypatch.setenv("KB_BACKEND", "sqlite")
         monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "test.db"))
         monkeypatch.setenv("VECTOR_ENABLED", "0")
+        # TestClient 不会真的监听 TCP；显式使用空闲端口，避免本机 18000 上
+        # 正在运行的已安装 kb-api 让 startup 防覆盖探针误判本用例。
+        monkeypatch.setenv("KB_PORT_API", str(_unused_loopback_port()))
 
         # 每用例重置控制面单例，确保 token 是新生成的
         get_embedding_service_state().reset_for_tests()
@@ -145,6 +156,7 @@ class TestStartupHookPersistsToken:
             monkeypatch.setenv("KB_BACKEND", "sqlite")
             monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "test.db"))
             monkeypatch.setenv("VECTOR_ENABLED", "0")
+            monkeypatch.setenv("KB_PORT_API", str(_unused_loopback_port()))
 
             get_embedding_service_state().reset_for_tests()
 
@@ -160,3 +172,28 @@ class TestStartupHookPersistsToken:
         finally:
             # 还原权限以便 pytest 能清理 tmp_path
             os.chmod(str(readonly_parent), 0o700)
+
+    def test_startup_keeps_winner_token_when_api_port_already_listens(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """短命 loser 的 startup 不得覆盖已监听实例的 owner token。"""
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        token_path = runtime / "owner_token"
+        token_path.write_text("winner-token", encoding="utf-8")
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = int(listener.getsockname()[1])
+
+            monkeypatch.setenv("KB_APP_ROOT", str(tmp_path))
+            monkeypatch.setenv("KB_PORT_API", str(port))
+            get_embedding_service_state().reset_for_tests()
+
+            from app.main import _persist_owner_token_on_startup
+
+            _persist_owner_token_on_startup()
+
+        assert token_path.read_text(encoding="utf-8") == "winner-token"
+        assert "skip owner_token write" in caplog.text

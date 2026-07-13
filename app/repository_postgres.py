@@ -63,6 +63,7 @@ class PostgresKnowledgeRepo(BaseKnowledgeRepo):
                       llm_timeout_sec DOUBLE PRECISION NOT NULL DEFAULT 30.0,
                       llm_temperature DOUBLE PRECISION NOT NULL DEFAULT 0.2,
                       llm_max_tokens INTEGER NOT NULL DEFAULT 1024,
+                      llm_max_tokens_auto BOOLEAN NOT NULL DEFAULT TRUE,
                       embedding_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                       embedding_api_key TEXT NOT NULL DEFAULT '',
                       embedding_base_url TEXT NOT NULL DEFAULT '',
@@ -89,6 +90,8 @@ class PostgresKnowledgeRepo(BaseKnowledgeRepo):
                 cur.execute("ALTER TABLE system_config ADD COLUMN IF NOT EXISTS llm_timeout_sec DOUBLE PRECISION NOT NULL DEFAULT 30.0")
                 cur.execute("ALTER TABLE system_config ADD COLUMN IF NOT EXISTS llm_temperature DOUBLE PRECISION NOT NULL DEFAULT 0.2")
                 cur.execute("ALTER TABLE system_config ADD COLUMN IF NOT EXISTS llm_max_tokens INTEGER NOT NULL DEFAULT 1024")
+                # 已有部署继续使用原显式 Token 限制；全新表由 CREATE 默认 TRUE。
+                cur.execute("ALTER TABLE system_config ADD COLUMN IF NOT EXISTS llm_max_tokens_auto BOOLEAN NOT NULL DEFAULT FALSE")
                 cur.execute("ALTER TABLE system_config ADD COLUMN IF NOT EXISTS embedding_enabled BOOLEAN NOT NULL DEFAULT FALSE")
                 cur.execute("ALTER TABLE system_config ADD COLUMN IF NOT EXISTS embedding_api_key TEXT NOT NULL DEFAULT ''")
                 cur.execute("ALTER TABLE system_config ADD COLUMN IF NOT EXISTS embedding_base_url TEXT NOT NULL DEFAULT ''")
@@ -647,13 +650,20 @@ class PostgresKnowledgeRepo(BaseKnowledgeRepo):
         return results
 
 
+    def has_system_config(self) -> bool:
+        """是否已经保存过系统设置，用于区分 DB 配置和 env fallback。"""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM system_config WHERE id = 1")
+                return cur.fetchone() is not None
+
     def get_system_config(self) -> dict[str, Any]:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     SELECT api_base_url, service_port, grafana_url, ui_theme,
-                           llm_enabled, llm_api_key, llm_base_url, llm_model, llm_timeout_sec, llm_temperature, llm_max_tokens,
+                           llm_enabled, llm_api_key, llm_base_url, llm_model, llm_timeout_sec, llm_temperature, llm_max_tokens, llm_max_tokens_auto,
                            embedding_enabled, embedding_api_key, embedding_base_url, embedding_model, embedding_dim, embedding_timeout_sec,
                            rerank_enabled, rerank_api_key, rerank_base_url, rerank_model, rerank_path, rerank_timeout_sec,
                            enrichment_enabled, updated_at
@@ -677,6 +687,7 @@ class PostgresKnowledgeRepo(BaseKnowledgeRepo):
             "llm_timeout_sec": 30.0,
             "llm_temperature": 0.2,
             "llm_max_tokens": 1024,
+            "llm_max_tokens_auto": True,
             "embedding_enabled": False,
             "embedding_api_key": "",
             "embedding_base_url": "",
@@ -705,6 +716,7 @@ class PostgresKnowledgeRepo(BaseKnowledgeRepo):
         llm_timeout_sec = float(payload.get("llm_timeout_sec") or 30.0)
         llm_temperature = float(payload.get("llm_temperature") or 0.2)
         llm_max_tokens = int(payload.get("llm_max_tokens") or 1024)
+        llm_max_tokens_auto = bool(payload.get("llm_max_tokens_auto", True))
         embedding_enabled = bool(payload.get("embedding_enabled", False))
         embedding_api_key = str(payload.get("embedding_api_key") or "").strip()
         embedding_base_url = str(payload.get("embedding_base_url") or "").strip().rstrip("/")
@@ -734,12 +746,12 @@ class PostgresKnowledgeRepo(BaseKnowledgeRepo):
                     INSERT INTO system_config (
                       id, api_base_url, service_port, grafana_url, ui_theme,
                       llm_enabled, llm_api_key, llm_base_url, llm_model,
-                      llm_timeout_sec, llm_temperature, llm_max_tokens,
+                      llm_timeout_sec, llm_temperature, llm_max_tokens, llm_max_tokens_auto,
                       embedding_enabled, embedding_api_key, embedding_base_url, embedding_model, embedding_dim, embedding_timeout_sec,
                       rerank_enabled, rerank_api_key, rerank_base_url, rerank_model, rerank_path, rerank_timeout_sec,
                       enrichment_enabled, updated_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT(id) DO UPDATE SET
                       api_base_url=excluded.api_base_url,
                       service_port=excluded.service_port,
@@ -752,6 +764,7 @@ class PostgresKnowledgeRepo(BaseKnowledgeRepo):
                       llm_timeout_sec=excluded.llm_timeout_sec,
                       llm_temperature=excluded.llm_temperature,
                       llm_max_tokens=excluded.llm_max_tokens,
+                      llm_max_tokens_auto=excluded.llm_max_tokens_auto,
                       embedding_enabled=excluded.embedding_enabled,
                       embedding_api_key=excluded.embedding_api_key,
                       embedding_base_url=excluded.embedding_base_url,
@@ -770,7 +783,7 @@ class PostgresKnowledgeRepo(BaseKnowledgeRepo):
                     (
                         1, api_base_url, service_port, grafana_url, ui_theme,
                         llm_enabled, llm_api_key, llm_base_url, llm_model,
-                        llm_timeout_sec, llm_temperature, llm_max_tokens,
+                        llm_timeout_sec, llm_temperature, llm_max_tokens, llm_max_tokens_auto,
                         embedding_enabled, embedding_api_key, embedding_base_url, embedding_model, embedding_dim, embedding_timeout_sec,
                         rerank_enabled, rerank_api_key, rerank_base_url, rerank_model, rerank_path, rerank_timeout_sec,
                         enrichment_enabled, now,

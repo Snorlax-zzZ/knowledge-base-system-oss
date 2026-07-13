@@ -10,9 +10,6 @@
   （因为 system_config 表也在 knowledge.db 里）
 - ``repo.clear_all_active_data()`` 只清业务表，**保留 system_config**（跟 shell 版语义不一致）
 - 因此本 service **不能** 直接调 ``repo.clear_all_active_data()``，必须走文件级 rm
-
-见 docs/_review_inputs/mac-side-audit-20260702/21-mac-cc-回答-win-mcp-tools-refactor.md 里
-A1.3 明确的 mirror 边界。
 """
 from __future__ import annotations
 

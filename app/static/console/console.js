@@ -465,7 +465,9 @@
       };
 
       const answerEl = el("ask-answer");
+      const answerWarningEl = el("ask-answer-warning");
       const chunksEl = el("ask-chunks");
+      if (answerWarningEl) answerWarningEl.hidden = true;
 
       if (!payload.question) {
         if (answerEl) answerEl.textContent = "问题不能为空。";
@@ -492,6 +494,18 @@
             answerEl.classList.add("empty-note");
             answerEl.classList.remove("ask-answer-rendered");
             answerEl.textContent = answerText;
+          }
+        }
+        if (answerWarningEl) {
+          answerWarningEl.hidden = !res.truncated;
+          if (!res.truncated) {
+            answerWarningEl.textContent = "";
+          } else if (configCache?.llm_max_tokens_auto !== false) {
+            answerWarningEl.textContent =
+              "回答达到模型供应商的输出长度上限，回答可能不完整。当前已是自动模式，可继续追问，或调整/更换模型。";
+          } else {
+            answerWarningEl.textContent =
+              "回答达到模型输出长度上限，回答可能不完整。请继续提问，或在系统设置中启用自动控制或调大 Max Tokens。";
           }
         }
 
@@ -527,9 +541,16 @@
         }
       } catch (err) {
         if (answerEl) answerEl.textContent = `问答失败：${err.message}`;
+        if (answerWarningEl) answerWarningEl.hidden = true;
         if (chunksEl) chunksEl.textContent = "无引用片段。";
       }
     });
+  }
+
+  function syncLlmMaxTokensState() {
+    const autoInput = el("cfg_llm_max_tokens_auto");
+    const tokenInput = el("cfg_llm_max_tokens");
+    if (tokenInput) tokenInput.disabled = !!autoInput?.checked;
   }
 
   function fillSettings(d) {
@@ -548,6 +569,8 @@
     if (el("cfg_llm_timeout_sec")) el("cfg_llm_timeout_sec").value = d.llm_timeout_sec ?? 30;
     if (el("cfg_llm_temperature")) el("cfg_llm_temperature").value = d.llm_temperature ?? 0.2;
     if (el("cfg_llm_max_tokens")) el("cfg_llm_max_tokens").value = d.llm_max_tokens ?? 1024;
+    if (el("cfg_llm_max_tokens_auto")) el("cfg_llm_max_tokens_auto").checked = d.llm_max_tokens_auto !== false;
+    syncLlmMaxTokensState();
 
     if (el("cfg_embedding_enabled")) el("cfg_embedding_enabled").checked = !!d.embedding_enabled;
     if (el("cfg_embedding_api_key")) el("cfg_embedding_api_key").value = d.embedding_api_key || "";
@@ -581,6 +604,7 @@
       llm_timeout_sec: Number(el("cfg_llm_timeout_sec")?.value || 30),
       llm_temperature: Number(el("cfg_llm_temperature")?.value || 0.2),
       llm_max_tokens: Number(el("cfg_llm_max_tokens")?.value || 1024),
+      llm_max_tokens_auto: !!el("cfg_llm_max_tokens_auto")?.checked,
     };
 
     if (el("cfg_embedding_enabled")) {
@@ -621,6 +645,11 @@
       const port = Number(event.target.value || 18000);
       if (el("cfg_api_base_url")) el("cfg_api_base_url").value = `http://127.0.0.1:${port}`;
     });
+  }
+
+  const llmMaxTokensAutoInput = el("cfg_llm_max_tokens_auto");
+  if (llmMaxTokensAutoInput) {
+    llmMaxTokensAutoInput.addEventListener("change", syncLlmMaxTokensState);
   }
 
   const settingsForm = el("settings-form");

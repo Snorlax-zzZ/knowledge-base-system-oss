@@ -7,12 +7,12 @@
   <link rel="icon" type="image/png" href="/static/console/assets/app-icon.png" />
   <link id="bootstrap-style" rel="stylesheet" href="/static/console/vendor/bootstrap.min.css" />
   <link id="bootstrap-icons-style" rel="stylesheet" href="/static/console/vendor/bootstrap-icons.css" />
-  <link id="console-style" rel="stylesheet" href="/static/console/console.css?v=layout-r19" />
+  <link id="console-style" rel="stylesheet" href="/static/console/console.css?v=layout-r20" />
   <script>
     if (location.protocol === "file:") {
       document.getElementById("bootstrap-style").href = "./vendor/bootstrap.min.css";
       document.getElementById("bootstrap-icons-style").href = "./vendor/bootstrap-icons.css";
-      document.getElementById("console-style").href = "./console.css?v=layout-r19";
+      document.getElementById("console-style").href = "./console.css?v=layout-r20";
     }
   </script>
 </head>
@@ -99,6 +99,7 @@
           </form>
           <hr />
           <div id="ask-answer" class="mb-3 empty-note">暂无回答。</div>
+          <div id="ask-answer-warning" class="ask-answer-warning" hidden>回答可能不完整。</div>
           <div id="ask-chunks" class="empty-note">暂无引用片段。</div>
         </div></div>
       </section>
@@ -137,9 +138,10 @@
             <div class="col-md-6 d-flex align-items-end"><div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="cfg_llm_enabled"><label class="form-check-label" for="cfg_llm_enabled">启用大模型问答</label></div></div>
             <div class="col-12"><label class="form-label">大模型密钥（LLM API Key）</label><input class="form-control" id="cfg_llm_api_key" type="password" /></div>
             <div class="col-12"><label class="form-label">大模型地址（LLM Base URL）</label><input class="form-control" id="cfg_llm_base_url" /></div>
-            <div class="col-md-6"><label class="form-label">大模型名称（LLM Model）</label><input class="form-control" id="cfg_llm_model" /></div>
+            <div class="col-md-4"><label class="form-label">大模型名称（LLM Model）</label><input class="form-control" id="cfg_llm_model" /></div>
             <div class="col-md-2"><label class="form-label">超时（Timeout）</label><input class="form-control" id="cfg_llm_timeout_sec" type="number" min="1" max="300" /></div>
             <div class="col-md-2"><label class="form-label">温度（Temp）</label><input class="form-control" id="cfg_llm_temperature" type="number" step="0.1" min="0" max="2" /></div>
+            <div class="col-md-2 d-flex align-items-end"><div class="form-check form-switch mb-2"><input class="form-check-input" type="checkbox" id="cfg_llm_max_tokens_auto"><label class="form-check-label" for="cfg_llm_max_tokens_auto">自动控制最大输出</label></div></div>
             <div class="col-md-2"><label class="form-label">最大令牌数（Max Tokens）</label><input class="form-control" id="cfg_llm_max_tokens" type="number" min="1" max="8192" /></div>
 
             <!-- Embedding 向量化模型 -->
@@ -184,8 +186,8 @@
     (function loadConsoleScript() {
       const s = document.createElement("script");
       s.src = location.protocol === "file:"
-        ? "./console.js?v=layout-r19"
-        : "/static/console/console.js?v=layout-r19";
+        ? "./console.js?v=layout-r20"
+        : "/static/console/console.js?v=layout-r20";
       document.body.appendChild(s);
     })();
   </script>

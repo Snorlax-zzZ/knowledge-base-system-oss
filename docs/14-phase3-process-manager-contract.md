@@ -2,7 +2,7 @@
 
 > **目的**：mac-app (`EmbeddingProcessManager.swift`) 与 windows-app (`embedding_process_manager.py`) 两个实现的唯一对照参考。两端必须遵守本契约，差异只允许出现在平台 API 层（Foundation `Process` vs Win32 Job Object）。
 >
-> **依据**：`openspec/changes/embedded-embedding-service/design.md` v1.2，§3.2 + §3.3 + §7 AC14/AC19/AC21/AC24/AC25/AC26 + §4.4。
+> **依据**：内部设计规范 v1.2（§3.2 + §3.3 + §7 AC14/AC19/AC21/AC24/AC25/AC26 + §4.4）。
 >
 > **不变量**：壳层是 infinity 子进程的**唯一 owner**。kb-api 只声明 desired-state，从不直接 spawn / kill / install。
 
@@ -370,7 +370,7 @@ kb-api 主服务必须**先**就绪，不等 infinity。具体：
 
 ## 13. v1.3 实装校正（2026-06-22）
 
-针对 v1.2 设计在真实装机时暴露的两个壳层契约缺口（详见 `openspec/changes/embedded-embedding-service/design.md` §13）：
+针对 v1.2 设计在真实装机时暴露的两个壳层契约缺口（详见内部设计规范 §13）：
 
 ### 13.1 InstallExecutor 跳过完整 model 检测（bug 1）
 

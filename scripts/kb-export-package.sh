@@ -5,7 +5,6 @@
 # app/services/knowledge_package.py:KnowledgePackageService.export_package。
 # Python 版产的 tarball 顶层含 {ts}/ 目录, 结构跟本脚本严格一致 (legacy lane),
 # 可跟本脚本产的 tarball 双向互操作。
-# 详见 docs/_review_inputs/2026-07-02-tarball-format-audit.md。
 set -euo pipefail
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then

@@ -52,6 +52,7 @@ class TestSpecFactory:
         # StartSpec 含 --port 追加
         assert "--port" in ctx.start_spec.start_cmd
         assert ctx.start_spec.port > 0
+        assert ctx.start_spec.cmdline_model_value == str(tmp_path / "models" / "bge-m3")
 
     def test_actual_port_reused_when_set(self, tmp_path):
         """已有 actual.port → 不重新 find_free_port，直接复用。"""

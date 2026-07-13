@@ -96,6 +96,10 @@
           <input id="llm_temperature" type="number" min="0" max="2" step="0.1" />
         </div>
         <div>
+          <label>最大输出模式</label>
+          <div class="switch"><input id="llm_max_tokens_auto" type="checkbox" /> <span>自动控制最大输出</span></div>
+        </div>
+        <div>
           <label for="llm_max_tokens">Max Tokens</label>
           <input id="llm_max_tokens" type="number" min="1" max="8192" step="1" />
         </div>
@@ -172,7 +176,7 @@
   <script>
     const fields = [
       "service_port","api_base_url","ui_theme","llm_enabled","llm_api_key","llm_base_url",
-      "llm_model","llm_timeout_sec","llm_temperature","llm_max_tokens"
+      "llm_model","llm_timeout_sec","llm_temperature","llm_max_tokens_auto","llm_max_tokens"
     ];
     const $status = document.getElementById("status");
     const $save = document.getElementById("save");
@@ -197,6 +201,12 @@
       return p;
     }
 
+    function syncLlmMaxTokensState() {
+      const auto = document.getElementById("llm_max_tokens_auto");
+      const llm_max_tokens = document.getElementById("llm_max_tokens");
+      llm_max_tokens.disabled = !!auto.checked;
+    }
+
     function fill(data) {
       for (const k of fields) {
         const el = document.getElementById(k);
@@ -207,6 +217,7 @@
       const p = Number(data.service_port || 18000);
       document.getElementById("service_port").value = p;
       document.getElementById("api_base_url").value = `http://127.0.0.1:${p}`;
+      syncLlmMaxTokensState();
     }
 
     async function loadConfig() {
@@ -237,6 +248,10 @@
         show("Save failed, please check input and service status", "err");
       }
     });
+
+    document.getElementById("llm_max_tokens_auto").addEventListener(
+      "change", syncLlmMaxTokensState
+    );
 
     loadConfig();
 

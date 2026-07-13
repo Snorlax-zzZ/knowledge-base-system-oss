@@ -28,7 +28,7 @@ def repo_with_data(tmp_path):
         "type": "fact",
         "content_markdown": "a paragraph",
         "summary": "",
-        "author": "test-user",
+        "author": "wzt",
         "change_note": "",
     })
     return repo, db_path, qdrant_dir

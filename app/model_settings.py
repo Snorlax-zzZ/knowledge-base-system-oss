@@ -48,6 +48,7 @@ class LlmConfig:
     timeout_sec: float
     temperature: float
     max_tokens: int
+    max_tokens_auto: bool
 
     @property
     def active(self) -> bool:
@@ -83,6 +84,9 @@ class RerankConfig:
 
 
 def llm_config_from_env() -> LlmConfig:
+    # 兼容升级：旧部署若显式配置过 KB_LLM_MAX_TOKENS，默认继续视为手动限制；
+    # 全新环境没有旧变量时默认 auto，由供应商决定输出长度。
+    auto_default = "KB_LLM_MAX_TOKENS" not in os.environ
     return LlmConfig(
         enabled=env_bool("KB_LLM_ENABLED", False),
         api_key=os.getenv("KB_LLM_API_KEY", "").strip(),
@@ -91,6 +95,7 @@ def llm_config_from_env() -> LlmConfig:
         timeout_sec=env_float("KB_LLM_TIMEOUT_SEC", 30.0),
         temperature=_clamp_float(env_float("KB_LLM_TEMPERATURE", 0.2), 0.0, 2.0),
         max_tokens=_clamp_int(env_int("KB_LLM_MAX_TOKENS", 1024), 1, 4096),
+        max_tokens_auto=env_bool("KB_LLM_MAX_TOKENS_AUTO", auto_default),
     )
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import logging
 import mimetypes
 import os
 import socket
@@ -15,6 +16,8 @@ import urllib.error
 import uuid
 import webbrowser
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # PyInstaller --onefile 解压到临时目录，Windows 默认不搜索该目录的 DLL
 if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -39,6 +42,100 @@ try:
     import tomllib
 except ModuleNotFoundError:
     import tomli as tomllib  # type: ignore[no-redef]
+
+
+def _query_exe_path_via_wmic(pid: int) -> str:
+    """v2 P1-5: wmic 首选路径 (Win 10 快, Win 11 22H2 前默认存在)."""
+    try:
+        result = subprocess.run(
+            ["wmic", "process", "where", f"ProcessId={pid}",
+             "get", "ExecutablePath", "/value"],
+            capture_output=True, text=True, timeout=3.0,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return ""
+    stdout = result.stdout or ""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("ExecutablePath="):
+            continue
+        return line.split("=", 1)[1].strip()
+    return ""
+
+
+def _query_exe_path_via_cim(pid: int) -> str:
+    """v2 P1-5: PowerShell Get-CimInstance fallback (Win 11 22H2+ wmic 已 deprecated).
+
+    参考: https://learn.microsoft.com/windows/deployment/planning/windows-10-deprecated-features
+    """
+    ps_script = (
+        f"Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" "
+        f"| Select-Object -ExpandProperty ExecutablePath"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            capture_output=True, text=True, timeout=5.0,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").strip()
+
+
+def _verify_kb_api_exe(pid: int, api_exe: Path) -> bool:
+    """校验 PID 的 ExecutablePath 精确匹配 ``api_exe``,防误杀外人进程 (N12)。
+
+    v2 P1-5: Windows 优先 wmic, fallback PowerShell Get-CimInstance
+    (Win 11 22H2+ wmic 已 deprecated 默认关闭).
+    - POSIX: ``/proc/{pid}/exe`` symlink 解析
+    - 查不到 / 解析失败 → 返 False (保守,拒发信号) 让 caller 明确 fallback
+
+    对齐 Mac ``kb-stop.sh`` "每次 signal 前重读 command" 语义。
+    """
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            resolved = Path(f"/proc/{pid}/exe").resolve()
+            return resolved == api_exe.resolve()
+        except (OSError, ValueError):
+            return False
+    # v2 P1-5: wmic → cim 双路径
+    path_str = _query_exe_path_via_wmic(pid)
+    if not path_str:
+        path_str = _query_exe_path_via_cim(pid)
+    if not path_str:
+        return False
+    try:
+        return Path(path_str).resolve() == api_exe.resolve()
+    except (OSError, ValueError):
+        return False
+
+
+def _fetch_desired_generation(port: int, token: str) -> int | None:
+    """GET /v1/system/embedding-service/desired-state 拿当前 generation, 供 /start CAS。
+
+    对齐 Mac ``performStartHandshake`` 的 expectedGeneration 参数机制:
+    - install POST 完成后, kb-api 内 desired-state 已 bump 到 install action
+    - 立即 GET 拿到那个 generation 塞进 /start payload 的 expected_generation
+    - kb-api /start handler 会 CAS 校验(app/main.py:1323-1332), 冲突 raise 409
+    - 拉不到 (网络问题 / 404 / 老版 kb-api) → 返回 None, caller 退化成无 CAS(旧行为)
+    """
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/system/embedding-service/desired-state",
+            headers={"X-Embedding-Owner-Token": token},
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            body = json.loads(r.read())
+    except Exception:
+        return None
+    gen = body.get("generation")
+    return int(gen) if isinstance(gen, int) else None
 
 
 def _install_root() -> Path:
@@ -305,13 +402,18 @@ class LocalTrayController:
                          daemon=True).start()
 
     def _do_start_embedding(self) -> None:
-        """串两步 POST /install + POST /start 让 kb-api bump desired-state：
-        1) /install 让 reconcile 跑 install(skip if complete)——保证半装场景 repair
-        2) /start 显式 promote 到 action=start——reconcile 才会 spawn infinity
+        """v2 P0-3 (对齐 Mac Swift chaining flag pattern):
+        1) manager.set_start_after_install_requested(True) 设 chain flag
+        2) POST /install (只这一个 POST, 不再主动 POST /start!)
+        3) manager 内部 reconcile loop dispatch install 成功后 consume flag
+           → CAS POST /start (携带 install 时的 expected_generation)
 
-        kb-api 侧 install handler 不会 auto-promote 到 start，跟 setup wizard 一致
-        （app/static/setup/index.html:475）。缺 /start 表现：desired 卡在 install，
-        reconcile 反复跑 install(skip)，infinity 永不 spawn（2026-07-02 P0 事故根因）。
+        v1 的 "tray 主动 POST install → 立即 GET generation → CAS POST /start"
+        属于 tray 抢跑 (复活历史 commit 079c9bc 修过的 bug), 与 Mac 现存 chaining
+        逻辑冲突。v2 撤销该抢跑, 改由 manager `_tick` 层在 install dispatch 真成功
+        后 chain start (对齐 Mac Swift `dispatch` case "install" 里的
+        `guard consumeStartAfterInstallRequest() else { return true }` 后
+        `try client.postStart(...)`)。
 
         用户可见反馈:
         - 立即 icon.notify 气球
@@ -342,6 +444,18 @@ class LocalTrayController:
                 return
             model_id = str(cfg.get("embedding_service_model_id") or "").strip() or "bge-m3"
             device = str(cfg.get("embedding_service_device") or "").strip() or "cpu"
+            # N1: pre-check embedding_service_mode
+            # Mac 侧 app/main.py::_require_local_embedding_mode 在 install/start/switch_model
+            # 三个入口 raise HTTPException(409, "install/start 仅允许在 mode=local 时执行")。
+            # 手动路径要在 POST 前主动拒绝并引导用户,避免看到裸 409 body 不知所措。
+            mode = str(cfg.get("embedding_service_mode") or "disabled").strip() or "disabled"
+            if mode != "local":
+                self._alert(
+                    "启动 Embedding 失败",
+                    f"当前 embedding_service_mode={mode}；install/start 仅允许在 mode=local。\n"
+                    "请到设置里切到 local 模式后再启动。",
+                )
+                return
 
             # 2) 读 owner_token
             token_path = self.root / "runtime" / "owner_token"
@@ -351,7 +465,18 @@ class LocalTrayController:
                 self._alert("启动 Embedding 失败", f"读 owner_token 失败: {e}")
                 return
 
-            # 3) POST /install 触发 desired bump（install action 会在模型完整时 skip 下载）
+            # 3) v2 P0-3: set chain flag → POST /install (不再主动 POST /start!)
+            #    manager 内部 tick 层 dispatch install 成功后 consume flag → CAS POST /start
+            try:
+                self._embedding_bundle.manager.set_start_after_install_requested(True)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("set_start_after_install_requested failed: %s", e)
+                self._alert(
+                    "启动 Embedding 失败",
+                    "embedding 管理器正在停止或尚未就绪，请稍候重试。",
+                )
+                return
+
             payload = json.dumps({"model_id": model_id, "device": device}).encode("utf-8")
             install_req = urllib.request.Request(
                 f"http://127.0.0.1:{self.port}/v1/system/embedding-service/install",
@@ -362,34 +487,28 @@ class LocalTrayController:
                 },
             )
             try:
-                with urllib.request.urlopen(install_req, timeout=20) as r:
-                    r.read()  # 消费掉 SSE stream 尾部 event
+                with urllib.request.urlopen(install_req, timeout=20) as _r:
+                    # N8: 只等 headers, 不消费 SSE body。install handler 在 kb-api 里
+                    # 是 async chain,提前关连接不阻断 install state。避免 SSE 全流
+                    # (冷装可能数分钟) 阻塞后续 tick 层 chain start POST。
+                    pass
             except urllib.error.HTTPError as e:
+                # POST 失败 → clear chain flag 避免下轮误 chain
+                try:
+                    self._embedding_bundle.manager.set_start_after_install_requested(False)
+                except Exception:  # noqa: BLE001
+                    pass
                 body = e.read().decode("utf-8", errors="replace")[:300]
                 self._alert("启动 Embedding 失败",
                             f"kb-api HTTP {e.code}\n{body}")
                 return
             except Exception as e:
+                try:
+                    self._embedding_bundle.manager.set_start_after_install_requested(False)
+                except Exception:  # noqa: BLE001
+                    pass
                 self._alert("启动 Embedding 失败", f"网络错误: {e}")
                 return
-
-            # 4) POST /start 显式 promote desired.action=install→start（跟 setup wizard 一致）。
-            # kb-api install handler 完成后不会 auto-promote，必须再 bump 一次；
-            # 缺这一步 reconcile 卡在 install(skip)，infinity 永不 spawn。
-            # 幂等——bump 失败只 warn，warmup 轮询继续（用户仍可看到最终结果）。
-            start_req = urllib.request.Request(
-                f"http://127.0.0.1:{self.port}/v1/system/embedding-service/start",
-                data=json.dumps({}).encode("utf-8"), method="POST",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Embedding-Owner-Token": token,
-                },
-            )
-            try:
-                with urllib.request.urlopen(start_req, timeout=10) as r:
-                    r.read()
-            except Exception:
-                pass  # 幂等失败不阻塞主流程；下游 warmup 轮询兜底
 
             self._notify("Embedding", "已请求启动，预计 30-60 秒完成 warmup…")
             self._rebuild_menu()
@@ -417,12 +536,12 @@ class LocalTrayController:
                     # 记但不立刻退 —— reconcile 可能重试成功；只在最终失败时报
                     last_err = snap.last_error
 
-            # 5) 超时
+            # 5) 超时 (B: 用 self.root 拼日志路径,消除 D:/KnowledgeBase 硬编码)
             tail = f"\n最后错误: {last_err[:200]}" if last_err else ""
+            infinity_log = str(self.root / "logs" / "infinity.log")
             self._alert(
                 "Embedding 启动超时",
-                f"{int(poll_deadline_sec)} 秒内未 warmup 就绪。请查 "
-                "D:/KnowledgeBase/logs/infinity.log。" + tail,
+                f"{int(poll_deadline_sec)} 秒内未 warmup 就绪。请查 {infinity_log}。" + tail,
             )
         finally:
             self._embedding_starting = False
@@ -591,13 +710,20 @@ class LocalTrayController:
 
     def _do_auto_bootstrap_embedding(self) -> None:
         """跟 _do_start_embedding 类似但静默：不弹 alert、只放一次气球通知。
-        串两步：先 POST /install（bump 到 install，reconcile 跑 install skip 或
-        真装），再 POST /start（bump 到 start，reconcile spawn infinity）。
-        两步必须都发——kb-api 侧 install handler 不会 auto-promote 到 start，
-        跟 setup wizard 一致（app/static/setup/index.html:475）。
-        缺 /start 表现：desired 卡在 install，reconcile 反复跑 install(skip)，
-        infinity 永不 spawn，横幅显示"已安装但未运行"（2026-07-02 P0 事故根因）。
-        用户可见就是横幅平滑消失 + 菜单翻绿。
+        v2 P0-3 (对齐 Mac Swift chaining flag pattern): 走跟 `_do_start_embedding` 一样的
+        set_start_after_install_requested(True) + 只 POST /install。manager 内部 tick
+        层 dispatch install 成功后 consume flag → CAS POST /start。
+
+        v1 的 "tray 主动 POST install → 立即 GET generation → CAS POST /start" 属于
+        tray 抢跑, 已在 v2 撤销 (对齐 Mac 端 chaining pattern)。
+
+        G3: 早期失败(config 拉不到 / token 读不到 / install POST 网络异常)时
+        reset ``_auto_bootstrap_attempted``,让下轮 poll 再试; 只有真正走到
+        install 请求发出后才让一次性标志留 True(避免用户可见的重复 install 请求)。
+
+        v2 P1-4 rearm 条件调整: 活 handle warmup timeout **不再 rearm**
+        (start 已接管成功等 self_heal 消化); 只 install 失败 / spawn 失败 / 链式
+        start transport failure 等终态失败才 rearm。
         """
         if self._embedding_bundle is None or self._embedding_starting:
             return
@@ -611,14 +737,41 @@ class LocalTrayController:
                 ) as r:
                     cfg = json.loads(r.read())
             except Exception:
+                # G3: kb-api 可能还没启完 → reset, 下轮 poll 重试
+                self._auto_bootstrap_attempted = False
                 return
             model_id = str(cfg.get("embedding_service_model_id") or "").strip() or "bge-m3"
             device = str(cfg.get("embedding_service_device") or "").strip() or "cpu"
+            # N1: auto-bootstrap 也要 pre-check mode; 不然 install/start 都会撞 409
+            # 静默 return, 用户看到横幅"已配置未运行"但不知原因(2026-07-10 workflow finding)。
+            # 走单次气球通知代替 alert(auto-bootstrap 语义 = 静默兜底), 让用户知道该去改 mode。
+            mode = str(cfg.get("embedding_service_mode") or "disabled").strip() or "disabled"
+            if mode != "local":
+                try:
+                    self._notify(
+                        "Embedding",
+                        f"当前 embedding_service_mode={mode},无法自动启动。"
+                        "如需本地 embedding 请到设置里切到 local。",
+                    )
+                except Exception:
+                    pass
+                return
 
             token_path = self.root / "runtime" / "owner_token"
             try:
                 token = token_path.read_text(encoding="utf-8").strip()
             except OSError:
+                # G3: token 未写入(kb-api 启动窗口) → reset, 下轮重试
+                self._auto_bootstrap_attempted = False
+                return
+
+            # v2 P0-3: set chain flag → POST /install (不再主动 POST /start!)
+            #    manager 内部 tick 层 dispatch install 成功后 consume flag → CAS POST /start
+            try:
+                self._embedding_bundle.manager.set_start_after_install_requested(True)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("auto-bootstrap: set_start_after_install_requested failed: %s", e)
+                self._auto_bootstrap_attempted = False
                 return
 
             payload = json.dumps({"model_id": model_id, "device": device}).encode("utf-8")
@@ -631,28 +784,17 @@ class LocalTrayController:
                 },
             )
             try:
-                with urllib.request.urlopen(install_req, timeout=20) as r:
-                    r.read()
+                with urllib.request.urlopen(install_req, timeout=20) as _r:
+                    # N8: 只等 headers 不消费 SSE body (install handler async chain)
+                    pass
             except Exception:
-                return  # 静默失败——菜单/横幅会保持"未运行"状态，用户可以手动点
-
-            # 显式 POST /start promote desired.action=install→start（跟 setup wizard 一致）。
-            # kb-api install handler 完成后不会自己 promote，必须再 bump 一次；否则
-            # reconcile 反复跑 install(skip)，infinity 永不 spawn（2026-07-02 P0 事故）。
-            # 幂等——bump 失败不阻塞 warmup 轮询（用户可从菜单手动重试）。
-            start_req = urllib.request.Request(
-                f"http://127.0.0.1:{self.port}/v1/system/embedding-service/start",
-                data=json.dumps({}).encode("utf-8"), method="POST",
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Embedding-Owner-Token": token,
-                },
-            )
-            try:
-                with urllib.request.urlopen(start_req, timeout=10) as r:
-                    r.read()
-            except Exception:
-                pass
+                # G3: install POST 网络异常 → clear chain flag + reset 下轮重试
+                try:
+                    self._embedding_bundle.manager.set_start_after_install_requested(False)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._auto_bootstrap_attempted = False
+                return
 
             # 一次性气球提示（不弹 alert，避免打扰）
             try:
@@ -746,10 +888,20 @@ class LocalTrayController:
         try:
             pids_to_kill: list[int] = []
             if self._proc is not None and self._proc.poll() is None:
+                # Popen-owned, 天然安全,免 exe 校验
                 pids_to_kill.append(self._proc.pid)
             port_pid = _find_pid_by_port(self.port)
             if port_pid is not None and port_pid not in pids_to_kill:
-                pids_to_kill.append(port_pid)
+                # N12: 端口找到的 PID 可能是 PID 复用后的外人(比如 Warp/其它服务),
+                # 必须 exe 路径校验通过才 kill; 不匹配 → 提醒用户手动处理
+                if _verify_kb_api_exe(port_pid, self._api_exe):
+                    pids_to_kill.append(port_pid)
+                else:
+                    self._notify(
+                        "端口被占用",
+                        f"端口 {self.port} 被非 kb-api 进程 (PID {port_pid}) 占用; "
+                        "请手动结束占用者或换端口。",
+                    )
 
             if not pids_to_kill:
                 self._notify("未运行", "服务当前未在运行")
@@ -1223,6 +1375,7 @@ class LocalTrayController:
 
     def _do_force_stop(self) -> None:
         killed: list[str] = []
+        blocked_pid: int | None = None
         try:
             if self._proc is not None:
                 try:
@@ -1233,18 +1386,31 @@ class LocalTrayController:
                 self._proc = None
             pid = _find_pid_by_port(self.port)
             if pid is not None:
-                subprocess.run(
-                    ["cmd.exe", "/c", f"taskkill /PID {pid} /T /F"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL,
-                    check=False,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-                killed.append(f"port {self.port} → PID {pid}")
+                # 兜底菜单也不能绕过归属校验。端口可能被其它应用占用；只有
+                # ExecutablePath 精确等于本安装的 kb-api.exe 才允许 taskkill。
+                if _verify_kb_api_exe(pid, self._api_exe):
+                    subprocess.run(
+                        ["cmd.exe", "/c", f"taskkill /PID {pid} /T /F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL,
+                        check=False,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                    killed.append(f"port {self.port} → PID {pid}")
+                else:
+                    blocked_pid = pid
             # 一并重置 busy（如果是它卡死导致 stop 灰）
             self._busy = False
-            if killed:
+            if blocked_pid is not None:
+                stopped = "已停止：" + " | ".join(killed) + "\n" if killed else ""
+                self._alert(
+                    "强制停止已拦截",
+                    stopped
+                    + f"端口 {self.port} 上的 PID {blocked_pid} 不是当前安装的 kb-api；"
+                    "未向该进程发送终止信号。",
+                )
+            elif killed:
                 self._alert("强制停止", "已停止：" + " | ".join(killed))
             else:
                 self._alert("强制停止", "没有找到正在跑的服务")
@@ -1271,7 +1437,9 @@ class LocalTrayController:
                 pids_to_kill.append(self._proc.pid)
             port_pid = _find_pid_by_port(self.port)
             if port_pid is not None and port_pid not in pids_to_kill:
-                pids_to_kill.append(port_pid)
+                # N12: 同 _do_stop, 校验 exe 路径匹配 kb-api.exe 再 kill
+                if _verify_kb_api_exe(port_pid, self._api_exe):
+                    pids_to_kill.append(port_pid)
             for pid in pids_to_kill:
                 subprocess.run(
                     ["cmd.exe", "/c", f"taskkill /PID {pid} /T /F"],

@@ -5,6 +5,8 @@ managed 布尔转换。对应 openspec embedded-embedding-service v1.2 配置变
 """
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from app.repository_sqlite import SqliteKnowledgeRepo
@@ -56,6 +58,100 @@ class TestRoundTrip:
         payload["embedding_service_managed"] = False
         repo.upsert_system_config(payload)
         assert repo.get_system_config()["embedding_service_managed"] is False
+
+    @pytest.mark.parametrize(
+        ("mode", "submitted_managed", "expected_managed"),
+        [
+            ("local", False, True),
+            ("external", True, False),
+            ("disabled", True, False),
+        ],
+    )
+    def test_upsert_enforces_managed_from_mode(
+        self,
+        repo: SqliteKnowledgeRepo,
+        mode: str,
+        submitted_managed: bool,
+        expected_managed: bool,
+    ) -> None:
+        """直接调用 repository 也不能持久化矛盾的 mode/managed 组合。"""
+        payload = _base_payload()
+        payload.update({
+            "embedding_service_mode": mode,
+            "embedding_service_managed": submitted_managed,
+        })
+
+        cfg = repo.upsert_system_config(payload)
+
+        assert cfg["embedding_service_mode"] == mode
+        assert cfg["embedding_service_managed"] is expected_managed
+
+
+class TestManagedModeMigration:
+    @pytest.mark.parametrize(
+        ("mode", "historical_managed", "expected_managed"),
+        [
+            ("local", 0, 1),
+            ("external", 1, 0),
+            ("disabled", 1, 0),
+        ],
+    )
+    def test_reopen_repairs_historical_mismatch_bidirectionally_and_idempotently(
+        self,
+        tmp_path,
+        mode: str,
+        historical_managed: int,
+        expected_managed: int,
+    ) -> None:
+        db_path = tmp_path / f"historical-{mode}.db"
+        repo = SqliteKnowledgeRepo(str(db_path))
+        repo.upsert_system_config(_base_payload())
+
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE managed_migration_audit (updates INTEGER NOT NULL);
+                INSERT INTO managed_migration_audit (updates) VALUES (0);
+                """
+            )
+            conn.execute(
+                "UPDATE system_config "
+                "SET embedding_service_mode = ?, embedding_service_managed = ? "
+                "WHERE id = 1",
+                (mode, historical_managed),
+            )
+            conn.executescript(
+                """
+                CREATE TRIGGER count_managed_migration
+                AFTER UPDATE OF embedding_service_managed ON system_config
+                BEGIN
+                    UPDATE managed_migration_audit SET updates = updates + 1;
+                END;
+                """
+            )
+
+        SqliteKnowledgeRepo(str(db_path))
+        with sqlite3.connect(db_path) as conn:
+            first_value = conn.execute(
+                "SELECT embedding_service_managed FROM system_config WHERE id = 1"
+            ).fetchone()[0]
+            first_updates = conn.execute(
+                "SELECT updates FROM managed_migration_audit"
+            ).fetchone()[0]
+
+        SqliteKnowledgeRepo(str(db_path))
+        with sqlite3.connect(db_path) as conn:
+            second_value = conn.execute(
+                "SELECT embedding_service_managed FROM system_config WHERE id = 1"
+            ).fetchone()[0]
+            second_updates = conn.execute(
+                "SELECT updates FROM managed_migration_audit"
+            ).fetchone()[0]
+
+        assert first_value == expected_managed
+        assert second_value == expected_managed
+        assert first_updates == 1
+        assert second_updates == first_updates
 
 
 class TestInvalidFallback:

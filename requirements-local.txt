@@ -6,5 +6,6 @@ pydantic==2.11.7
 mcp>=1.0.0,<2.0.0
 httpx==0.28.1
 prometheus-client>=0.21.0
+portalocker==3.2.0
 # Optional vector search client. If omitted, system degrades to keyword search.
 qdrant-client==1.16.0

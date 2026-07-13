@@ -1,6 +1,8 @@
 """BackupService.import_overwrite 测试：happy path / 回滚 / sha256 / schema / Qdrant 顺序。"""
 from __future__ import annotations
 
+import json
+import sqlite3
 import shutil
 import tarfile
 from pathlib import Path
@@ -27,7 +29,7 @@ def populated_repo_and_pkg(tmp_path):
             "type": "fact",
             "content_markdown": f"local content {i}",
             "summary": "",
-            "author": "test-user",
+            "author": "wzt",
             "change_note": "",
         })
 
@@ -43,7 +45,7 @@ def populated_repo_and_pkg(tmp_path):
         "type": "fact",
         "content_markdown": "from backup",
         "summary": "",
-        "author": "test-user",
+        "author": "wzt",
         "change_note": "",
     })
     backup_svc = BackupService(
@@ -120,6 +122,72 @@ def test_overwrite_replaces_all_items(tmp_path, populated_repo_and_pkg):
     assert result["items_after"] == 1
     assert "auto_backup_path" in result
     assert Path(result["auto_backup_path"]).exists()
+
+
+def test_overwrite_migrates_legacy_db_before_restoring_system_config(
+    tmp_path,
+    populated_repo_and_pkg,
+):
+    """旧包覆盖 live DB 后必须先补 schema，再按旧语义恢复配置。"""
+    from app.repository_sqlite import SqliteKnowledgeRepo
+    from app.services.backup_service import _sha256_of_file
+
+    repo, db, qdrant, pkg = populated_repo_and_pkg
+    work = tmp_path / "legacy-package"
+    work.mkdir()
+    with tarfile.open(pkg, "r:gz") as tar:
+        tar.extractall(work)
+
+    legacy_db = work / "data" / "knowledge.db"
+    legacy_repo = SqliteKnowledgeRepo(sqlite_path=str(legacy_db), vector_index=None)
+    legacy_repo.upsert_system_config(
+        {
+            "api_base_url": "http://127.0.0.1:18000",
+            "service_port": 18000,
+            "grafana_url": "http://127.0.0.1:3000",
+            "ui_theme": "neo",
+            "llm_enabled": True,
+            "llm_api_key": "legacy-key",
+            "llm_base_url": "https://legacy.example/v1",
+            "llm_model": "legacy-model",
+            "llm_max_tokens": 2345,
+            "llm_max_tokens_auto": False,
+        }
+    )
+    with sqlite3.connect(legacy_db) as conn:
+        conn.execute("ALTER TABLE system_config DROP COLUMN llm_max_tokens_auto")
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("PRAGMA journal_mode=DELETE")
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(system_config)").fetchall()
+        }
+        assert "llm_max_tokens_auto" not in columns
+
+    manifest_path = work / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["knowledge_db_sha256"] = _sha256_of_file(legacy_db)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    legacy_pkg = tmp_path / "legacy-backup.tar.gz"
+    with tarfile.open(legacy_pkg, "w:gz") as tar:
+        for item in sorted(work.rglob("*")):
+            if item.is_file():
+                tar.add(item, arcname=str(item.relative_to(work)))
+
+    svc = _make_service(repo, db, qdrant)
+    result = svc.import_overwrite(
+        package_path=str(legacy_pkg),
+        auto_backup_service=_auto(db, qdrant, tmp_path / "legacy-auto-backup"),
+    )
+
+    assert result["ok"] is True
+    restored = repo.get_system_config()
+    assert restored["llm_max_tokens"] == 2345
+    assert restored["llm_max_tokens_auto"] is False
 
 
 # ---------------------------------------------------------------------------

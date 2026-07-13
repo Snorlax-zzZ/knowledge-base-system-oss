@@ -37,7 +37,7 @@ def test_concurrent_upsert_during_import_returns_503(client):
                 "domain": "work",
                 "type": "fact",
                 "content_markdown": "x",
-                "author": "test-user",
+                "author": "wzt",
             },
         )
         assert resp.status_code == 503

@@ -5,7 +5,7 @@
 改成 in-process 调用 :class:`KnowledgePackageService` / :class:`KnowledgeClearService`，
 消除 Windows 上 `WinError 193`（subprocess 无法 exec `.sh` shebang 文件）。
 
-**产品线边界**（对齐 docs/_review_inputs/2026-07-02-tarball-format-audit.md）：
+**产品线边界**：
 
 - **Legacy lane**（本模块）：``/v1/knowledge/{cleanup-expired,clear,export-package,
   import-package}``，Python 版严格 mirror shell 版行为（tarball 顶层 ``{ts}/`` +

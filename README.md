@@ -186,10 +186,10 @@ cp agent-integration/SKILL.md ~/.codex/skills/knowledge-base-first/SKILL.md
 # 1) 构建 kb-api 二进制（依赖 .venv + pyinstaller）
 ./scripts/build_mac_kb_api.sh
 
-# 2) 生成直装 dmg（默认版本 1.0.0）
+# 2) 生成直装 dmg（默认版本 1.3.13）
 ./scripts/build_mac_direct_install_dmg.sh
 # 或：构建 api + 打包一步完成
-./scripts/build_mac_direct_install_dmg.sh --build-api 1.0.0
+./scripts/build_mac_direct_install_dmg.sh --build-api 1.3.13
 ```
 
 产物位置：`dist/KnowledgeBase-mac-direct-<version>.dmg`

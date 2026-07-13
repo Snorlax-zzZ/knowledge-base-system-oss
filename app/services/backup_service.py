@@ -274,8 +274,8 @@ class BackupService:
           4. 外层 auto-backup snapshot（永久保留）
           5. on_qdrant_close() 释放 Qdrant 文件锁
           6. 内层 .pre-restore.bak + .pre-restore-qdrant（cp 一份原 data）
-          7. clear_all_active_data + cp 备份内 db / qdrant 还原
-          8. 用备份 db 的 system_config 覆盖当前 config（含真凭证）
+          7. clear_all_active_data + cp 备份内 db / qdrant 还原，并迁移旧 DB schema
+          8. 用迁移后的 system_config 覆盖当前 config（含真凭证）
           9. 删除内层 .pre-restore.* 副本（成功路径）
          10. finally: on_qdrant_reinit()
         步骤 6-9 任意失败 → 用 .pre-restore.* 回滚 → BackupImportError
@@ -366,6 +366,10 @@ class BackupService:
                     # 步骤 7: 清表 + 还原
                     self.repo.clear_all_active_data()
                     shutil.copy2(db_path_in_pkg, sqlite_path)
+                    # 文件级覆盖可能把当前 DB 降回旧 schema；必须先运行仓储迁移，
+                    # 再用当前版本的 upsert 回填配置。否则旧备份缺少新增列时会
+                    # 触发 no column 并整次回滚。
+                    self.repo.reset_schema()
                     if qdrant_path.exists():
                         shutil.rmtree(qdrant_path)
                     if qdrant_in_pkg.exists():
@@ -446,8 +450,12 @@ class BackupService:
         if row is None:
             return
         payload = {k: row[k] for k in row.keys() if k not in ("id", "updated_at")}
+        # 旧版本备份没有模式列；它的 llm_max_tokens 当时始终是显式限制，恢复时
+        # 必须保持手动语义，不能套用“新安装默认 auto”的 repository fallback。
+        payload.setdefault("llm_max_tokens_auto", False)
         for bool_field in (
             "llm_enabled",
+            "llm_max_tokens_auto",
             "embedding_enabled",
             "rerank_enabled",
             "enrichment_enabled",
@@ -553,5 +561,3 @@ class AutoBackupService:
             str(bak_dir),
         )
         return str(bak_dir)
-
-

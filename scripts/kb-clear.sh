@@ -4,7 +4,6 @@
 # API endpoint /v1/knowledge/clear 契约已迁移到 app/services/knowledge_clear.py。
 # shell 版和 Python 版严格等语义(factory reset: rm data/knowledge.db +
 # import_state.json + qdrant_local 后重建空 qdrant_local, system_config 也一起清)。
-# 详见 docs/_review_inputs/2026-07-02-tarball-format-audit.md。
 set -euo pipefail
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then

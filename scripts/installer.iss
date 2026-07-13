@@ -69,8 +69,12 @@ Source: "{#RootDir}\使用说明.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RootDir}\VERSION"; DestDir: "{app}"; Flags: ignoreversion
 ; 直装版重启脚本（/v1/system/restart 调用）
 Source: "{#RootDir}\scripts\local-restart-direct.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+; 安装根限定的停止脚本（卸载与开发 fallback 共用，禁止按进程名全局强杀）
+Source: "{#RootDir}\scripts\local-stop.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 ; Agent 接入工具包
-Source: "{#RootDir}\agent-integration\*"; DestDir: "{app}\agent-integration"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#RootDir}\agent-integration\kb-mcp-proxy.py"; DestDir: "{app}\agent-integration"; Flags: ignoreversion
+Source: "{#RootDir}\agent-integration\SKILL.md"; DestDir: "{app}\agent-integration"; Flags: ignoreversion
+Source: "{#RootDir}\agent-integration\安装说明.md"; DestDir: "{app}\agent-integration"; Flags: ignoreversion
 
 [InstallDelete]
 ; 1.3.12 onefile→onedir 迁移:删 1.3.11 及以前的 bin\kb-api.exe + bin\kb-tray.exe
@@ -79,6 +83,9 @@ Source: "{#RootDir}\agent-integration\*"; DestDir: "{app}\agent-integration"; Fl
 ; 版本,任务管理器看 exe 路径也乱)。升级路径必须显式清旧 onefile 残留。
 Type: files; Name: "{app}\bin\kb-api.exe"
 Type: files; Name: "{app}\bin\kb-tray.exe"
+; 旧版 agent-integration 通配打包可能遗留 __pycache__/*.pyc；新版改成精确白名单后
+; Inno 不会自动删除不再出现在 [Files] 的旧文件，升级时显式清扫。
+Type: filesandordirs; Name: "{app}\agent-integration\__pycache__"
 
 [Dirs]
 ; 运行时目录，预先建好避免权限问题
@@ -97,9 +104,8 @@ Filename: "{app}\使用说明.md"; Description: "查看使用说明"; Flags: now
 Filename: "{app}\bin\{#AppExeName}"; Description: "启动百变怪芝士包"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; 卸载前先终止进程
-Filename: "taskkill.exe"; Parameters: "/IM kb-tray.exe /F"; Flags: runhidden waituntilterminated; RunOnceId: "KillTray"
-Filename: "taskkill.exe"; Parameters: "/IM kb-api.exe /F";  Flags: runhidden waituntilterminated; RunOnceId: "KillApi"
+; 卸载前只终止当前安装根拥有的进程，不按 kb-api.exe / kb-tray.exe 名称全局强杀。
+Filename: "powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\scripts\local-stop.ps1"" -IncludeTray"; WorkingDir: "{app}"; Flags: runhidden waituntilterminated; RunOnceId: "StopOwnedProcesses"
 
 [UninstallDelete]
 ; 卸载时始终清理"程序文件"，与 mac Uninstall.command 行为对齐：
@@ -180,7 +186,24 @@ begin
   end;
 end;
 
+// 检查运行时真正会调用的 PATH `python` 是否恰好为 3.13。
+// 注册表或 py launcher 命中但 PATH 无 python 时，当前 create_venv_cmd 仍会失败，
+// 因此不能把它们当作可用；Anaconda / pyenv-win / portable 只要 PATH 正确即可通过。
+function IsPython313Available(): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := False;
+  if Exec(ExpandConstant('{cmd}'),
+          '/D /C python -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 13) else 1)" >nul 2>&1',
+          '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    if ResultCode = 0 then
+      Result := True;
+end;
+
 function InitializeSetup(): Boolean;
+var
+  PyChoice: Integer;
 begin
   Result := True;
   if IsProcessRunning('kb-api.exe') or IsProcessRunning('kb-tray.exe') then
@@ -190,6 +213,30 @@ begin
            '（防止 SQLite / Qdrant 拿到不一致 snapshot）',
            mbError, MB_OK);
     Result := False;
+    Exit;
+  end;
+
+  // D1 直装承诺前置检查: local embedding 需外部 Python 3.13
+  // 未装不阻断安装 (embedding_service_mode 可以是 external 或 disabled, 那种情况不需要 Python)
+  // 只提示用户: 若打算用 local embedding, 请先装 Python 3.13
+  if not IsPython313Available() then
+  begin
+    PyChoice := MsgBox(
+      '未检测到 PATH 中可直接执行的 Python 3.13。' + #13#10 + #13#10 +
+      '直装版核心组件(kb-api / kb-tray / SQLite / Qdrant)不需要 Python，可以正常安装使用。' + #13#10 + #13#10 +
+      '但若你打算启用「本地 Embedding 服务」(embedding_service_mode=local, 默认关闭)，' +
+      '需要系统预装 Python 3.13:' + #13#10 +
+      '  下载地址: https://www.python.org/downloads/release/python-3130/' + #13#10 +
+      '  或用 winget: winget install Python.Python.3.13' + #13#10 + #13#10 +
+      '是否继续安装?' + #13#10 +
+      '  [是] 继续 (稍后再装 Python, 或只用 external/disabled 模式)' + #13#10 +
+      '  [否] 取消 (先装 Python 再回来装知识库)',
+      mbConfirmation, MB_YESNO);
+    if PyChoice = IDNO then
+    begin
+      Result := False;
+      Exit;
+    end;
   end;
 end;
 

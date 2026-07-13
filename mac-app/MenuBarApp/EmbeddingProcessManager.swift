@@ -148,6 +148,61 @@ final class OwnerTokenSource {
 
 // MARK: - KbApiClient
 
+/// ``/install`` 返回长连接 SSE，但 desired-state 在响应头发出前已经 bump 完成。
+/// 客户端只等到 HTTP 响应头就应返回，不能继续等待/解析 SSE 正文；否则模型 repair
+/// 超过普通 JSON 请求的 5 秒 timeout 后，会被误判失败并永远串不到 ``/start``。
+private final class ResponseHeaderWaiter: NSObject, URLSessionDataDelegate {
+    private let lock = NSLock()
+    private let done = DispatchSemaphore(value: 0)
+    private var finished = false
+    private var statusCode: Int?
+    private var responseError: Error?
+
+    private func finish(statusCode: Int? = nil, error: Error? = nil) {
+        lock.lock()
+        if !finished {
+            finished = true
+            self.statusCode = statusCode
+            self.responseError = error
+            lock.unlock()
+            done.signal()
+            return
+        }
+        lock.unlock()
+    }
+
+    func wait(timeout: TimeInterval) -> (Int?, Error?) {
+        guard done.wait(timeout: .now() + timeout) == .success else {
+            return (nil, URLError(.timedOut))
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        return (statusCode, responseError)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        finish(statusCode: status)
+        // desired 已受理；取消正文流不会撤销服务端已经完成的 bump。
+        completionHandler(.cancel)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        if let error = error {
+            finish(error: error)
+        }
+    }
+}
+
 final class KbApiClient {
     let baseURL: URL
     let tokenSource: OwnerTokenSource
@@ -199,10 +254,17 @@ final class KbApiClient {
     /// device P1-2 fix(2026-07-02):auto-bootstrap 场景 desired 归零,不显式传
     /// device 会让 kb-api 走 "cpu" 兜底吞掉 DB 里的 mps/cuda 配置。传空串让 kb-api
     /// 走"prev.device > DB config > cpu" 三级兜底(main.py post_embedding_service_start)。
-    func postStart(modelId: String, device: String = "") throws {
+    func postStart(
+        modelId: String,
+        device: String = "",
+        expectedGeneration: Int? = nil
+    ) throws {
         var payload: [String: Any] = ["model_id": modelId]
         if !device.isEmpty {
             payload["device"] = device
+        }
+        if let expectedGeneration = expectedGeneration {
+            payload["expected_generation"] = expectedGeneration
         }
         _ = try doRequest(
             method: "POST",
@@ -216,11 +278,43 @@ final class KbApiClient {
     /// 保护半装 venv → repair pip 缺失包)。仅在 auto-bootstrap 前置 probe 失败时调,
     /// 走 install repair 路径,避免用户装机后半装 venv 起 infinity 挂。
     func postInstall(modelId: String, device: String) throws {
-        _ = try doRequest(
-            method: "POST",
-            path: "/v1/system/embedding-service/install",
-            payload: ["model_id": modelId, "device": device]
+        let token = try tokenSource.loadBlocking()
+        let path = "/v1/system/embedding-service/install"
+        var req = URLRequest(url: baseURL.appendingPathComponent(path))
+        req.httpMethod = "POST"
+        req.setValue(token, forHTTPHeaderField: "X-Embedding-Owner-Token")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        req.httpBody = try JSONSerialization.data(
+            withJSONObject: ["model_id": modelId, "device": device],
+            options: []
         )
+
+        let waiter = ResponseHeaderWaiter()
+        let headerSession = URLSession(
+            configuration: session.configuration,
+            delegate: waiter,
+            delegateQueue: nil
+        )
+        defer { headerSession.invalidateAndCancel() }
+        headerSession.dataTask(with: req).resume()
+
+        let (statusCode, error) = waiter.wait(timeout: 20.0)
+        guard let status = statusCode else {
+            throw EmbedError.kbApiTransport(
+                "transport failure: \(error ?? URLError(.unknown))"
+            )
+        }
+        if status == 401 || status == 403 {
+            tokenSource.invalidate()
+            throw EmbedError.kbApiUnauthorized("POST \(path) -> \(status)")
+        }
+        if status == 409 {
+            throw EmbedError.kbApiConflict("POST \(path) -> 409")
+        }
+        if status < 200 || status >= 400 {
+            throw EmbedError.kbApiTransport("POST \(path) -> \(status)")
+        }
     }
 
     // MARK: - 内部 IO
@@ -355,10 +449,16 @@ final class ProcessRunner {
     /// timeout 传 nil 表示无超时(waitUntilExit),传 >0 秒数超时后 SIGTERM + 再 waitUntilExit。
     /// 超时视为失败,exit code 用 -1 区分正常 exit;stdoutTail 里追加 "[timeout ${sec}s]"。
     /// 用途:venvDepsReady 探测 import torch dylib 卡死时不能阻塞 reconcile loop(P2-1)。
-    func run(_ cmd: [String], logPath: URL? = nil, timeout: TimeInterval? = nil) -> CommandResult {
+    func run(
+        _ cmd: [String],
+        logPath: URL? = nil,
+        timeout: TimeInterval? = nil,
+        cwd: URL? = nil
+    ) -> CommandResult {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: cmd[0])
         proc.arguments = Array(cmd.dropFirst())
+        proc.currentDirectoryURL = cwd
 
         var logHandle: FileHandle?
         if let lp = logPath {
@@ -552,8 +652,8 @@ final class InstallExecutor {
     ///   2 = click 版本 >= 8.2(需 Step2 pin click<8.2 修 typer 兼容)
     ///   3 = numpy 版本不符合 py 版本区间约束
     ///
-    /// 20s timeout 对齐 Win embedding_process_manager.py:_venv_deps_ready(import torch
-    /// 首次 5-10s + 冷启 1-3s,20s 覆盖慢机器)。timeout 视为 exit != 0 走 pip 兜底。
+    /// 实机完整 import 冷启动测得约 21s；20s 会把健康 venv 稳定误判成损坏。
+    /// 60s 保留卡死上限，同时覆盖慢盘/冷缓存。timeout 仍视为 exit != 0 走 pip 兜底。
     fileprivate func venvDepsReady(venvDir: String) -> Bool {
         let venvPython = "\(venvDir)/bin/python"
         guard FileManager.default.isExecutableFile(atPath: venvPython) else {
@@ -586,14 +686,21 @@ final class InstallExecutor {
         sys.exit(0)
         """
         let probeCmd = [venvPython, "-c", probeScript]
-        let res = runner.run(probeCmd, logPath: pipLogPath, timeout: 20.0)
+        let serviceDir = URL(fileURLWithPath: venvDir).deletingLastPathComponent()
+        let res = runner.run(
+            probeCmd,
+            logPath: pipLogPath,
+            timeout: 60.0,
+            cwd: serviceDir
+        )
         if res.exitCode != 0 {
             NSLog("venvDepsReady: probe failed (exit=\(res.exitCode), venv=\(venvDir))")
         }
         return res.exitCode == 0
     }
 
-    /// 判定规则（保守）：config.json 存在 且 至少一份权重文件（.safetensors / .bin / onnx/*.onnx）
+    /// 判定规则（保守）：config.json 存在，且至少一份 PyTorch 权重文件
+    ///（model.safetensors / pytorch_model.bin）满足大小门槛。
     /// 单文件大于 50MB（防止只下了元数据壳就被误判为完整）。
     ///
     /// 不命中（即使只缺一份权重）就放弃跳过，让 snapshot_download 走标准 resume 路径。
@@ -608,7 +715,6 @@ final class InstallExecutor {
         // model.safetensors；把 onnx/model.onnx_data 也算完整会跳过 snapshot_download
         // 后 infinity 撞 OSError(no file named pytorch_model.bin, ...)。
         // Mac 端 device=mps 同样走 torch engine，同样只吃 PyTorch 权重。
-        // (2026-07-01 审计 P1：本次同步收干净，Mac 用户不再踩 Windows 已修过的坑)
         let weightCandidates: [String] = [
             "pytorch_model.bin",
             "model.safetensors",
@@ -662,16 +768,95 @@ struct StartSpec {
     let env: [String: String]  // 启动时合并进 proc.environment（如 INFINITY_BETTERTRANSFORMER=false）
 }
 
+/// 同时接受 CLI 的 ``--name value`` 与 ``--name=value`` 两种等价写法，并用
+/// 空白/行尾边界避免 ``--port 7687`` 误匹配 ``--port 76870``。
+private func commandLineContainsOption(
+    _ cmdline: String,
+    name: String,
+    value: String
+) -> Bool {
+    let escapedName = NSRegularExpression.escapedPattern(for: name)
+    let escapedValue = NSRegularExpression.escapedPattern(for: value)
+    let pattern = "(?:^|\\s)\(escapedName)(?:\\s+|=)\(escapedValue)(?=\\s|$)"
+    return cmdline.range(of: pattern, options: .regularExpression) != nil
+}
+
 final class InfinityProcess {
-    let process: Process
+    private let process: Process?
+    private let adoptedExpectedModelId: String?
+    private let adoptedExpectedPort: Int?
     let pid: Int32
+
     init(process: Process) {
         self.process = process
+        self.adoptedExpectedModelId = nil
+        self.adoptedExpectedPort = nil
         self.pid = process.processIdentifier
     }
-    var isRunning: Bool { process.isRunning }
-    func terminate() { process.terminate() }
-    func kill() { Foundation.kill(pid, SIGKILL) }
+
+    /// 把上次菜单栏异常退出后遗留、且已由 cleaner 校验过的 infinity PID
+    /// 包装成可终止句柄。每次发信号前都会重新核对 cmdline，防 PID 复用误杀。
+    init(adoptedPid: Int32, expectedModelId: String, expectedPort: Int) {
+        self.process = nil
+        self.adoptedExpectedModelId = expectedModelId
+        self.adoptedExpectedPort = expectedPort
+        self.pid = adoptedPid
+    }
+
+    var isRunning: Bool {
+        if let process = process {
+            return process.isRunning
+        }
+        return adoptedProcessIsStillOwned()
+    }
+
+    var isAdopted: Bool { process == nil }
+
+    func terminate() {
+        if let process = process {
+            process.terminate()
+        } else if adoptedProcessIsStillOwned() {
+            _ = Foundation.kill(pid, SIGTERM)
+        }
+    }
+
+    @discardableResult
+    func kill() -> Bool {
+        guard process != nil || adoptedProcessIsStillOwned() else { return false }
+        return Foundation.kill(pid, SIGKILL) == 0
+    }
+
+    private func adoptedProcessIsStillOwned() -> Bool {
+        guard process == nil, pid > 0 else { return false }
+        guard Foundation.kill(pid, 0) == 0 || errno == EPERM else { return false }
+
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-p", "\(pid)", "-o", "command="]
+        let pipe = Pipe()
+        ps.standardOutput = pipe
+        ps.standardError = Pipe()
+        do {
+            try ps.run()
+        } catch {
+            return false
+        }
+        ps.waitUntilExit()
+        guard ps.terminationStatus == 0 else { return false }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let cmdline = String(data: data, encoding: .utf8),
+              let expectedModelId = adoptedExpectedModelId,
+              let expectedPort = adoptedExpectedPort else {
+            return false
+        }
+        return cmdline.contains("infinity")
+            && commandLineContainsOption(
+                cmdline, name: "--port", value: "\(expectedPort)"
+            )
+            && commandLineContainsOption(
+                cmdline, name: "--model-id", value: expectedModelId
+            )
+    }
 }
 
 final class StartHandler {
@@ -683,8 +868,13 @@ final class StartHandler {
         self.probeIntervalSec = probeIntervalSec
     }
 
-    /// Spawn 并等 ready。返回 (handle, ready, lastError)。
-    func spawnAndWaitReady(_ spec: StartSpec) -> (InfinityProcess?, Bool, String) {
+    /// Spawn 并等 ready。onSpawn 在进入最长 120 秒的 warmup 等待前发布句柄，
+    /// 让 App 退出流程能立即接管并终止刚生成的 infinity 子进程。
+    /// 返回 (handle, ready, lastError)。
+    func spawnAndWaitReady(
+        _ spec: StartSpec,
+        onSpawn: ((InfinityProcess) -> Void)? = nil
+    ) -> (InfinityProcess?, Bool, String) {
         // 准备 log 文件
         try? FileManager.default.createDirectory(
             at: spec.infinityLogPath.deletingLastPathComponent(),
@@ -745,6 +935,7 @@ final class StartHandler {
             to: spec.runtimeDir.appendingPathComponent("port"),
             atomically: true, encoding: .utf8
         )
+        onSpawn?(handle)
 
         let deadline = Date().addingTimeInterval(warmupTimeoutSec)
         while Date() < deadline {
@@ -777,6 +968,12 @@ final class StartHandler {
     }
 }
 
+struct StopResult {
+    let stopped: Bool
+    let graceful: Bool
+    let lastError: String
+}
+
 final class StopHandler {
     let graceSec: Double
     let pollIntervalSec: Double
@@ -785,8 +982,9 @@ final class StopHandler {
         self.pollIntervalSec = pollIntervalSec
     }
 
-    /// terminate -> wait grace -> kill。返回 (graceful, lastError)。
-    func terminateAndWait(_ handle: InfinityProcess, runtimeDir: URL) -> (Bool, String) {
+    /// terminate -> wait grace -> kill。返回一次稳定的最终判定，调用方不再额外
+    /// probe（adopted PID 在 SIGKILL 后短暂仍出现在 ps 时会造成假失败）。
+    func terminateAndWait(_ handle: InfinityProcess, runtimeDir: URL) -> StopResult {
         handle.terminate()
         let deadline = Date().addingTimeInterval(graceSec)
         var graceful = false
@@ -797,22 +995,31 @@ final class StopHandler {
             }
             Thread.sleep(forTimeInterval: pollIntervalSec)
         }
+        var stopped = graceful
         var lastErr = ""
         if !graceful {
-            handle.kill()
+            let killSent = handle.kill()
             let dl2 = Date().addingTimeInterval(1.0)
             while Date() < dl2 {
                 if !handle.isRunning { break }
                 Thread.sleep(forTimeInterval: pollIntervalSec)
             }
-            if handle.isRunning {
+            stopped = !handle.isRunning
+            // adopted 进程不是当前 Process 的 child；SIGKILL 已成功送达后，kernel
+            // / ps 可能在极短窗口里仍暴露旧 cmdline。此时信任 signal delivery，
+            // 避免把同一 stop generation 判失败后再次调度。
+            if !stopped && handle.isAdopted && killSent {
+                stopped = true
+            } else if !stopped {
                 lastErr = "process did not respond to SIGKILL"
             }
         }
-        for fname in ["pid", "port"] {
-            try? FileManager.default.removeItem(at: runtimeDir.appendingPathComponent(fname))
+        if stopped {
+            for fname in ["pid", "port"] {
+                try? FileManager.default.removeItem(at: runtimeDir.appendingPathComponent(fname))
+            }
         }
-        return (graceful, lastErr)
+        return StopResult(stopped: stopped, graceful: graceful, lastError: lastErr)
     }
 }
 
@@ -838,8 +1045,11 @@ final class StaleResidueCleaner {
 
         let cmdline = psCmdline(pid: pid)
         if cmdline.contains("infinity"),
-           let p = port, cmdline.contains("--port \(p)"),
-           cmdline.contains("--model-id \(expectedModelId)") {
+           let p = port,
+           commandLineContainsOption(cmdline, name: "--port", value: "\(p)"),
+           commandLineContainsOption(
+               cmdline, name: "--model-id", value: expectedModelId
+           ) {
             return (pid, port)
         }
         // 外人占了 PID,告诉 caller 端口 stale
@@ -900,11 +1110,19 @@ final class EmbeddingProcessManager {
     private var backoff: Double = 0.0
     private let maxBackoffSec: Double = 30.0
 
+    private let lifecycleLock = NSLock()
     private var stopFlag = false
     private let workQueue = DispatchQueue(label: "embed.reconcile", qos: .utility)
+    // runLoop 永久占用 workQueue；启动握手必须走独立串行队列，否则排在
+    // runLoop 后面永远得不到执行。串行化还能避免 auto/manual 两次启动乱序。
+    private let commandQueue = DispatchQueue(label: "embed.commands", qos: .utility)
 
-    // auto-bootstrap 一次性标志(整个 mgr 生命周期只 attempt 一次)
+    // auto-bootstrap 成功后只触发一次；失败会重新放开，让后续 tick 重试。
+    // 与 stopFlag 共用 lifecycleLock，避免 reconcile/command 两个队列数据竞争。
     private var autoBootstrapAttempted = false
+    // venv probe 失败时先 repair install；安装真正完成后由 reconcile 再 POST
+    // /start，补上 auto/manual 没有 setup 前端替它串联 start 的缺口。
+    private var startAfterInstallRequested = false
 
     init(
         client: KbApiClient,
@@ -935,7 +1153,9 @@ final class EmbeddingProcessManager {
     }
 
     func stop(timeoutSec: Double = 5.0) {
+        lifecycleLock.lock()
         stopFlag = true
+        lifecycleLock.unlock()
         // 顺带关掉 infinity 子进程,避免 tray quit 后 orphan
         actualLock.lock()
         let handle = currentHandle
@@ -944,6 +1164,14 @@ final class EmbeddingProcessManager {
         if let h = handle {
             _ = stopper.terminateAndWait(h, runtimeDir: runtimeDir)
         }
+        actualLock.lock()
+        if handle == nil || currentHandle?.pid == handle?.pid {
+            currentHandle = nil
+        }
+        actual.running = false
+        actual.warmingUp = false
+        actual.pid = nil
+        actualLock.unlock()
     }
 
     func snapshotActual() -> EmbedActualState {
@@ -954,8 +1182,56 @@ final class EmbeddingProcessManager {
 
     // MARK: - 主循环
 
+    private func isStopping() -> Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return stopFlag
+    }
+
+    private func hasAutoBootstrapAttempted() -> Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return autoBootstrapAttempted
+    }
+
+    private func markAutoBootstrapAttempted() {
+        lifecycleLock.lock()
+        autoBootstrapAttempted = true
+        lifecycleLock.unlock()
+    }
+
+    private func beginAutoBootstrapAttempt() -> Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        if stopFlag || autoBootstrapAttempted { return false }
+        autoBootstrapAttempted = true
+        return true
+    }
+
+    private func resetAutoBootstrapAttempt() {
+        lifecycleLock.lock()
+        if !stopFlag {
+            autoBootstrapAttempted = false
+        }
+        lifecycleLock.unlock()
+    }
+
+    private func setStartAfterInstallRequested(_ requested: Bool) {
+        lifecycleLock.lock()
+        startAfterInstallRequested = requested
+        lifecycleLock.unlock()
+    }
+
+    private func consumeStartAfterInstallRequest() -> Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        let requested = startAfterInstallRequested
+        startAfterInstallRequested = false
+        return requested
+    }
+
     private func runLoop() {
-        while !stopFlag {
+        while !isStopping() {
             do {
                 try tick()
             } catch {
@@ -965,7 +1241,7 @@ final class EmbeddingProcessManager {
             // 拆分小 sleep 块让 stopFlag 能更快被检测
             let chunk = 0.5
             var elapsed = 0.0
-            while elapsed < delay && !stopFlag {
+            while elapsed < delay && !isStopping() {
                 Thread.sleep(forTimeInterval: min(chunk, delay - elapsed))
                 elapsed += chunk
             }
@@ -989,7 +1265,6 @@ final class EmbeddingProcessManager {
         var desired: EmbedDesiredState
         do {
             desired = try client.getDesired()
-            backoff = 0.0
         } catch EmbedError.kbApiUnauthorized {
             // token invalidate 已在 client 完成;下轮直接 retry
             return
@@ -999,13 +1274,24 @@ final class EmbeddingProcessManager {
             return
         }
 
+        // stop 可能发生在阻塞 HTTP 请求期间；不要在退出窗口里再 dispatch start。
+        if isStopping() { return }
+
         if shouldSkip(desired: desired) {
+            backoff = 0.0
             maybeHeartbeat(desired: desired)
             return
         }
-        dispatch(desired: desired)
-        lastDoneGeneration = desired.generation
-        writeActual(desired: desired)
+        let completed = dispatch(desired: desired)
+        if completed {
+            lastDoneGeneration = desired.generation
+            writeActual(desired: desired)
+        } else {
+            // spec 拉取、安装或 spawn 任一失败时都不能把 generation 记成已完成；
+            // 保留同一 desired 给后续 tick 重试，并带指数退避避免热循环。
+            bumpBackoff()
+            writeActual(desired: desired, acknowledgeDesired: false)
+        }
     }
 
     // MARK: - Auto-bootstrap (2026-07-01)
@@ -1027,13 +1313,13 @@ final class EmbeddingProcessManager {
     /// 5. runtime/owner_token 能读到
     /// 6. 后台线程 POST /v1/system/embedding-service/start 让 kb-api bump desired=start
     private func maybeAutoBootstrap() {
-        if autoBootstrapAttempted { return }
+        if hasAutoBootstrapAttempted() { return }
         // 1) 磁盘装了吗
         if !filesystemSaysInstalled() { return }
         // 2) actual 里已经跑起来了就别动
         let snap = snapshotActual()
         if snap.running || snap.warmingUp {
-            autoBootstrapAttempted = true  // 已经好了,标记 attempted 防未来重触发
+            markAutoBootstrapAttempted()  // 已经好了,标记 attempted 防未来重触发
             return
         }
         // 3) 拉 desired-state 判是不是内存归零态
@@ -1045,19 +1331,37 @@ final class EmbeddingProcessManager {
             return
         }
         if desired.action != "none" || desired.enabled {
-            autoBootstrapAttempted = true  // 有活跃 desired,不覆盖
+            markAutoBootstrapAttempted()  // 有活跃 desired,不覆盖
             return
         }
-        // 4) 读 owner_token(auto-bootstrap 完整链路里 token 是 /start POST 必须的)
+
+        // 4) 只允许 DB 明确配置为 local 时恢复本地 infinity。external/disabled
+        // 即使磁盘还留有旧模型，也不能被冷启兜底逻辑反向拉起。
+        let mode: String
+        do {
+            let cfg = try client.getSystemConfig()
+            mode = (cfg["embedding_service_mode"] as? String) ?? "disabled"
+        } catch {
+            // kb-api 可能仍在冷启；保留重试机会。
+            return
+        }
+        guard mode == "local" else {
+            markAutoBootstrapAttempted()
+            return
+        }
+
+        // 5) 读 owner_token(auto-bootstrap 完整链路里 token 是 /start POST 必须的)
         let tokenPath = dataRoot.appendingPathComponent("runtime").appendingPathComponent("owner_token")
         guard let tokenData = try? String(contentsOf: tokenPath, encoding: .utf8) else { return }
         let token = tokenData.trimmingCharacters(in: .whitespacesAndNewlines)
         if token.isEmpty { return }
-        // 5) 触发静默 auto-bootstrap(后台线程,不阻塞 reconcile loop)
-        autoBootstrapAttempted = true
+
+        // 6) 原子抢占本次 attempt，再异步握手；失败会 reset 供下一轮 tick 重试。
+        guard beginAutoBootstrapAttempt() else { return }
         NSLog("auto-bootstrap: triggering start (filesystem installed, desired=none, actual not running)")
-        workQueue.async { [weak self] in
-            self?.triggerAutoBootstrapStart(token: token)
+        commandQueue.async { [weak self] in
+            guard let self = self, !self.isStopping() else { return }
+            self.triggerAutoBootstrapStart(token: token)
         }
     }
 
@@ -1105,7 +1409,11 @@ final class EmbeddingProcessManager {
     /// 现薄封装 performStartHandshake,供 auto-bootstrap 路径调用(忽略返回值)。
     /// 用户可见:横幅平滑消失 + 菜单翻绿(通常 30-60s)。
     private func triggerAutoBootstrapStart(token: String) {
-        _ = performStartHandshake(token: token)
+        let result = performStartHandshake(token: token)
+        if case .failure(let error) = result {
+            NSLog("auto-bootstrap: start handshake failed, will retry: \(error)")
+            resetAutoBootstrapAttempt()
+        }
     }
 
     /// UI 手动触发入口(对齐 Win 侧 tray_app_local.py:_on_start_embedding)。
@@ -1141,7 +1449,7 @@ final class EmbeddingProcessManager {
             }
             return
         }
-        workQueue.async { [weak self] in
+        commandQueue.async { [weak self] in
             guard let self = self else { return }
             let result = self.performStartHandshake(token: token)
             DispatchQueue.main.async {
@@ -1158,14 +1466,22 @@ final class EmbeddingProcessManager {
     ///    半装 venv(Step1 装成 Step2 fail)会通过;走 /start 会绕过 InstallExecutor
     ///    里的 venvDepsReady skip → doStart 起 infinity 可能撞 click/numpy 兼容坑。
     ///    显式跑 venvDepsReady 强 probe,失败 fallback /install repair 路径。
-    ///    (2026-07-02 P0 外部审计 flag)
     /// 3) probe 通过 → POST /start(带 owner_token,让 kb-api bump desired=start)
     private func performStartHandshake(token: String) -> Result<Void, Error> {
+        if isStopping() {
+            return .failure(EmbedError.kbApiTransport("embedding manager is stopping"))
+        }
         // 1) 拉 config
         let modelId: String
         let device: String
         do {
             let cfg = try client.getSystemConfig()
+            let mode = (cfg["embedding_service_mode"] as? String) ?? "disabled"
+            guard mode == "local" else {
+                return .failure(EmbedError.kbApiTransport(
+                    "embedding service mode is \(mode), local start is not allowed"
+                ))
+            }
             modelId = (cfg["embedding_service_model_id"] as? String).flatMap {
                 $0.isEmpty ? nil : $0
             } ?? "bge-m3"
@@ -1181,13 +1497,21 @@ final class EmbeddingProcessManager {
             .appendingPathComponent("embedding-service")
             .appendingPathComponent("venv").path
         let probeOK = installer.venvDepsReady(venvDir: venvDir)
+        // probe 可能阻塞数秒；退出发生在这期间时不能再下发 install/start。
+        if isStopping() {
+            return .failure(EmbedError.kbApiTransport("embedding manager is stopping"))
+        }
         if !probeOK {
             let effectiveDevice = device.isEmpty ? "cpu" : device
+            // 必须先置标志再 POST：/install 一旦 bump desired，reconcile 可能在
+            // HTTP/SSE 请求返回前就完成安装；后置标志会错过唯一一次 install dispatch。
+            setStartAfterInstallRequested(true)
             do {
                 try client.postInstall(modelId: modelId, device: effectiveDevice)
                 NSLog("start handshake: probe failed, fallback /install repair POST (model=\(modelId), device=\(effectiveDevice))")
                 return .success(())
             } catch {
+                setStartAfterInstallRequested(false)
                 NSLog("start handshake: probe failed AND install fallback POST failed: \(error)")
                 return .failure(error)
             }
@@ -1242,33 +1566,62 @@ final class EmbeddingProcessManager {
         return desired.generation <= lastDoneGeneration
     }
 
-    private func dispatch(desired: EmbedDesiredState) {
+    private func dispatch(desired: EmbedDesiredState) -> Bool {
         let (installSpec, startSpec, runtimeDir) = specFactory(desired, snapshotActual())
         switch desired.action {
         case "install":
-            _ = doInstall(desired: desired, spec: installSpec)
+            let installed = doInstall(desired: desired, spec: installSpec)
+            guard installed else { return false }
+            guard consumeStartAfterInstallRequest() else { return true }
+            if isStopping() { return false }
+            do {
+                try client.postStart(
+                    modelId: desired.modelId,
+                    device: desired.device,
+                    expectedGeneration: desired.generation
+                )
+                NSLog("install repair completed: chained /start POST (model=\(desired.modelId))")
+                return true
+            } catch EmbedError.kbApiConflict {
+                // 用户已切 external/disabled；后端 mode guard 拒绝旧 start，新的
+                // desired=stop 会在下一 tick 执行，不能把 repair 标志留给未来安装。
+                setStartAfterInstallRequested(false)
+                return true
+            } catch {
+                // 临时网络/token 失败：保留同一 install generation 重试，下一轮
+                // install 幂等命中后再次尝试 /start。
+                setStartAfterInstallRequested(true)
+                actualLock.lock()
+                actual.lastError = "install completed but chained start POST failed: \(error)"
+                actualLock.unlock()
+                return false
+            }
         case "start":
-            doStart(desired: desired, spec: startSpec, runtimeDir: runtimeDir)
+            return doStart(desired: desired, spec: startSpec, runtimeDir: runtimeDir)
         case "stop":
-            doStop(desired: desired, runtimeDir: runtimeDir)
+            return doStop(desired: desired, runtimeDir: runtimeDir)
         case "switch_model":
             // 2026-07-02 P1-1 fix:install 失败不允许继续 doStart(否则壳层拿旧
             // 模型的 venv 试图起新模型,启动失败但 actual.installed=false 会导致
             // 用户 UI 状态混乱)。对齐 Win embedding_process_manager.py:1739 分支。
-            doStop(desired: desired, runtimeDir: runtimeDir)
+            guard doStop(desired: desired, runtimeDir: runtimeDir) else {
+                return false
+            }
             var installOK = true
             if let isp = installSpec {
                 installOK = doInstall(desired: desired, spec: isp)
             }
             if installOK {
-                doStart(desired: desired, spec: startSpec, runtimeDir: runtimeDir)
+                return doStart(desired: desired, spec: startSpec, runtimeDir: runtimeDir)
             } else {
                 NSLog("switch_model: install failed, skip doStart to avoid confused state")
+                return false
             }
         default:
             actualLock.lock()
             actual.lastError = "unknown action: \(desired.action)"
             actualLock.unlock()
+            return false
         }
     }
 
@@ -1291,28 +1644,117 @@ final class EmbeddingProcessManager {
         return ok
     }
 
-    private func doStart(desired: EmbedDesiredState, spec: StartSpec?, runtimeDir: URL) {
+    private func doStart(
+        desired: EmbedDesiredState,
+        spec: StartSpec?,
+        runtimeDir: URL
+    ) -> Bool {
         guard let s = spec else {
             actualLock.lock()
             actual.lastError = "start spec missing"
             actualLock.unlock()
-            return
+            return false
         }
-        let (adoptPid, _) = cleaner.adoptOrClean(expectedModelId: s.modelId)
-        if let pid = adoptPid {
+        let (adoptPid, adoptPort) = cleaner.adoptOrClean(expectedModelId: s.modelId)
+        if let pid = adoptPid, let port = adoptPort {
+            let adoptedHandle = InfinityProcess(
+                adoptedPid: pid,
+                expectedModelId: s.modelId,
+                expectedPort: port
+            )
             actualLock.lock()
+            currentHandle = adoptedHandle
+            actual.installed = true
             actual.running = true
             actual.warmingUp = false
             actual.pid = Int(pid)
-            actual.port = s.port
+            actual.port = port
             actual.modelId = desired.modelId
             actual.lastError = ""
             actualLock.unlock()
-            return
+
+            // stop 可能在 cleaner 校验完成、currentHandle 登记前抢先看到 nil。
+            // 登记后再检查一次；若退出已开始，由当前分支负责收掉 adopted 进程。
+            if isStopping() {
+                // App 退出只给后台清理很短窗口；这个分支说明常规 stop 已经错过
+                // 句柄，直接 SIGKILL，避免再等 3 秒 grace 后 App 先退出留 orphan。
+                adoptedHandle.kill()
+                for fname in ["pid", "port"] {
+                    try? FileManager.default.removeItem(
+                        at: runtimeDir.appendingPathComponent(fname)
+                    )
+                }
+                actualLock.lock()
+                if currentHandle?.pid == adoptedHandle.pid {
+                    currentHandle = nil
+                }
+                actual.running = false
+                actual.warmingUp = false
+                actual.pid = nil
+                actualLock.unlock()
+                return false
+            }
+            return true
         }
-        let (handle, ready, err) = starter.spawnAndWaitReady(s)
+        // 冷启恢复期间先发布 warming 状态。否则 spawnAndWaitReady 最长阻塞 120s，
+        // kb-api actual 仍是 installed=false，控制台会误导用户重新安装。
         actualLock.lock()
-        defer { actualLock.unlock() }
+        actual.installed = true
+        actual.running = false
+        actual.warmingUp = true
+        actual.pid = nil
+        actual.port = s.port
+        actual.modelId = desired.modelId
+        actual.device = desired.device
+        actual.lastError = ""
+        actualLock.unlock()
+        writeActual(desired: desired, acknowledgeDesired: false)
+
+        let (handle, ready, err) = starter.spawnAndWaitReady(
+            s,
+            onSpawn: { [weak self] spawned in
+                guard let self = self else { return }
+                self.actualLock.lock()
+                self.currentHandle = spawned
+                self.actual.pid = Int(spawned.pid)
+                self.actualLock.unlock()
+
+                // stop 可能发生在 proc.run 与句柄发布之间；此处补杀，避免 orphan。
+                if self.isStopping() {
+                    // stop() 已经读到 nil 并返回时不能再走 3 秒 grace；App 的退出
+                    // 清理窗口更短，直接发 SIGKILL，确保信号在进程退出前送达。
+                    spawned.kill()
+                    for fname in ["pid", "port"] {
+                        try? FileManager.default.removeItem(
+                            at: runtimeDir.appendingPathComponent(fname)
+                        )
+                    }
+                }
+            }
+        )
+
+        // warmup 等待期间退出时，stop()/onSpawn 已负责终止进程；不要再把
+        // 结束后的 handle 回写成 running=true，并清掉可能残留的 pid/port。
+        if isStopping() {
+            if let h = handle, h.isRunning {
+                _ = stopper.terminateAndWait(h, runtimeDir: runtimeDir)
+            }
+            for fname in ["pid", "port"] {
+                try? FileManager.default.removeItem(
+                    at: runtimeDir.appendingPathComponent(fname)
+                )
+            }
+            actualLock.lock()
+            currentHandle = nil
+            actual.running = false
+            actual.warmingUp = false
+            actual.pid = nil
+            actual.lastError = ""
+            actualLock.unlock()
+            return false
+        }
+
+        actualLock.lock()
         if let h = handle {
             currentHandle = h
             actual.running = true
@@ -1323,13 +1765,20 @@ final class EmbeddingProcessManager {
             actual.device = desired.device
             actual.lastError = ready ? "" : err
         } else {
+            // onSpawn 已在 warmup 前登记过 handle/pid；若子进程在 warmup 期间
+            // 退出，StartHandler 会返回 nil，必须清掉早登记的 dead Process 引用。
+            currentHandle = nil
             actual.running = false
             actual.warmingUp = false
+            actual.pid = nil
             actual.lastError = err
         }
+        let succeeded = handle != nil
+        actualLock.unlock()
+        return succeeded
     }
 
-    private func doStop(desired: EmbedDesiredState, runtimeDir: URL) {
+    private func doStop(desired: EmbedDesiredState, runtimeDir: URL) -> Bool {
         actualLock.lock()
         let handle = currentHandle
         actualLock.unlock()
@@ -1340,18 +1789,30 @@ final class EmbeddingProcessManager {
             actual.pid = nil
             actual.lastError = ""
             actualLock.unlock()
-            return
+            return true
         }
-        let (graceful, err) = stopper.terminateAndWait(h, runtimeDir: runtimeDir)
+        let result = stopper.terminateAndWait(h, runtimeDir: runtimeDir)
         actualLock.lock()
-        currentHandle = nil
-        restartCount = 0
-        actual.running = false
-        actual.warmingUp = false
-        actual.pid = nil
-        actual.restartCount = 0
-        actual.lastError = err.isEmpty ? (graceful ? "" : "force-killed after grace") : err
+        if result.stopped {
+            currentHandle = nil
+            restartCount = 0
+            actual.running = false
+            actual.warmingUp = false
+            actual.pid = nil
+            actual.restartCount = 0
+            actual.lastError = result.lastError.isEmpty
+                ? (result.graceful ? "" : "force-killed after grace")
+                : result.lastError
+        } else {
+            // 未观测到停止且 SIGKILL 也未成功送达：保留 handle 供同 generation
+            // 在 backoff 后重试，不能先清引用再让下一 tick 假装 stop 已完成。
+            currentHandle = h
+            actual.running = true
+            actual.pid = Int(h.pid)
+            actual.lastError = result.lastError
+        }
         actualLock.unlock()
+        return result.stopped
     }
 
     private func maybeHeartbeat(desired: EmbedDesiredState) {
@@ -1362,17 +1823,25 @@ final class EmbeddingProcessManager {
         writeActual(desired: desired)
     }
 
-    private func writeActual(desired: EmbedDesiredState) {
+    private func writeActual(
+        desired: EmbedDesiredState,
+        acknowledgeDesired: Bool = true
+    ) {
         actualLock.lock()
         var snap = actual
         actualLock.unlock()
-        snap.acknowledgedGeneration = max(
-            snap.acknowledgedGeneration, lastDoneGeneration, desired.generation
-        )
+        snap.acknowledgedGeneration = max(snap.acknowledgedGeneration, lastDoneGeneration)
+        if acknowledgeDesired {
+            snap.acknowledgedGeneration = max(
+                snap.acknowledgedGeneration, desired.generation
+            )
+        }
         do {
             try client.postActual(snap)
             lastHeartbeatAt = Date().timeIntervalSince1970
-            backoff = 0.0
+            if acknowledgeDesired {
+                backoff = 0.0
+            }
         } catch EmbedError.kbApiConflict {
             // 心跳时 generation 落后,丢弃即可
         } catch EmbedError.kbApiUnauthorized {

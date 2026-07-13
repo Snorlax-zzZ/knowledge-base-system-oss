@@ -37,6 +37,19 @@ def _owner_token() -> str:
     return get_embedding_service_state().owner_token
 
 
+def _configure_local_mode(client) -> None:
+    """为 install/start 端点测试建立合法 local 配置，并把 desired 归零。"""
+    cfg = client.get("/v1/system/config").json()
+    cfg["embedding_service_mode"] = "local"
+    cfg["embedding_service_model_id"] = "bge-m3"
+    cfg["confirm_reindex"] = "I-CONFIRM-REINDEX"
+    response = client.put("/v1/system/config", json=cfg)
+    assert response.status_code == 200, response.text
+
+    from app.services.embedding_service_state import get_embedding_service_state
+    get_embedding_service_state().reset_for_tests()
+
+
 # ---------------------------------------------------------------------------
 # GET /v1/system/embedding-models —— Phase 4 /setup 用模型注册表
 # ---------------------------------------------------------------------------
@@ -305,6 +318,39 @@ class TestActualStateEndpoint:
         assert after["embedding_dim"] == 384
         assert after["embedding_enabled"] is False
 
+    def test_stale_local_heartbeat_cannot_reenable_embedding_after_disabled(self, client):
+        """local→disabled 后旧进程最后一次 running heartbeat 不得回滚新配置。"""
+        cfg = client.get("/v1/system/config").json()
+        cfg["embedding_service_mode"] = "local"
+        cfg["embedding_service_model_id"] = "bge-m3"
+        cfg["confirm_reindex"] = "I-CONFIRM-REINDEX"
+        assert client.put("/v1/system/config", json=cfg).status_code == 200
+
+        cfg = client.get("/v1/system/config").json()
+        cfg["embedding_service_mode"] = "disabled"
+        cfg["confirm_reindex"] = "I-CONFIRM-REINDEX"
+        assert client.put("/v1/system/config", json=cfg).status_code == 200
+        before = client.get("/v1/system/config").json()
+        assert before["embedding_enabled"] is False
+
+        from app.services.embedding_service_state import get_embedding_service_state
+        generation = get_embedding_service_state().desired().generation
+        r = self._post_actual(
+            client,
+            _owner_token(),
+            generation=generation,
+            installed=True,
+            running=True,
+            port=7687,
+            model_id="bge-m3",
+        )
+        assert r.status_code == 200
+
+        after = client.get("/v1/system/config").json()
+        assert after["embedding_service_mode"] == "disabled"
+        assert after["embedding_enabled"] is False
+        assert after["embedding_service_port"] == before["embedding_service_port"]
+
     def test_running_actual_sync_is_idempotent(self, client):
         """同样的 running actual 多次回写 config 不应重复变化（幂等）。"""
         cfg = client.get("/v1/system/config").json()
@@ -340,18 +386,37 @@ class TestInstallEndpoint:
         )
         assert r.status_code == 400
 
-    def test_install_bumps_desired_state(self, client, tmp_path, monkeypatch):
-        """install 写期望状态后应可在 desired-state 端点读到。
+    def test_install_rejected_when_service_mode_is_disabled(
+        self, client, tmp_path, monkeypatch
+    ):
+        from app.services.install_progress import InstallSseStreamer
 
-        预置一个 ``phase=completed`` 的状态文件让 SSE 立刻终止，避免 TestClient
-        被 streamer 默认 30 分钟硬上限阻塞。
-        """
-        import json as _json
         monkeypatch.setenv("KB_APP_ROOT", str(tmp_path))
-        runtime_dir = tmp_path / "runtime"
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        (runtime_dir / "install_status.json").write_text(
-            _json.dumps({"phase": "completed"})
+        monkeypatch.setattr(
+            InstallSseStreamer,
+            "events",
+            lambda self: iter(['event: status\ndata: {"phase":"accepted"}\n\n']),
+        )
+        r = client.post(
+            "/v1/system/embedding-service/install",
+            json={"model_id": "bge-m3"},
+        )
+        assert r.status_code == 409
+        assert "mode=local" in r.json()["detail"]
+
+    def test_install_bumps_desired_state(self, client, tmp_path, monkeypatch):
+        """install 写期望状态后应可在 desired-state 端点读到。"""
+        from app.services.install_progress import InstallSseStreamer
+
+        _configure_local_mode(client)
+        monkeypatch.setenv("KB_APP_ROOT", str(tmp_path))
+
+        # API 端点只负责创建 streamer；真实 tail 时序由 test_install_progress.py
+        # 覆盖。这里注入有限事件，避免 TestClient 等待壳层写文件。
+        monkeypatch.setattr(
+            InstallSseStreamer,
+            "events",
+            lambda self: iter(['event: status\ndata: {"phase":"accepted"}\n\n']),
         )
 
         r = client.post(
@@ -373,27 +438,108 @@ class TestInstallEndpoint:
         assert body["enabled"] is True
         assert body["generation"] == 1
 
-    def test_install_sse_emits_initial_status(self, client, tmp_path, monkeypatch):
-        """壳层已写 install_status.json 时 SSE 第一帧应转发该快照。"""
+    def test_install_resets_stale_terminal_status_before_streaming(
+        self, client, tmp_path, monkeypatch
+    ):
+        """新一轮 install 必须删掉上一轮 terminal 快照，避免 SSE 秒结束。"""
         import json as _json
+        from app.services.install_progress import InstallSseStreamer
+
+        _configure_local_mode(client)
         monkeypatch.setenv("KB_APP_ROOT", str(tmp_path))
         runtime_dir = tmp_path / "runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
         status_file = runtime_dir / "install_status.json"
-        # phase=completed 让 streamer 立刻终止，TestClient 才不会无限等
         status_file.write_text(_json.dumps({"phase": "completed", "progress": 1.0}))
+
+        stale_removed: list[bool] = []
+
+        def finite_events(streamer):
+            stale_removed.append(not streamer._status_path.exists())
+            yield 'event: status\ndata: {"phase":"accepted"}\n\n'
+
+        monkeypatch.setattr(InstallSseStreamer, "events", finite_events)
 
         r = client.post(
             "/v1/system/embedding-service/install",
             json={"model_id": "bge-m3"},
         )
-        body = r.text
-        assert "event: status" in body
-        assert '"phase": "completed"' in body
+        assert r.status_code == 200
+        assert stale_removed == [True]
+        assert '"phase":"accepted"' in r.text
 
 
 class TestStartStopEndpoints:
+    def test_start_rejected_when_service_mode_is_disabled(self, client):
+        r = client.post(
+            "/v1/system/embedding-service/start",
+            json={"model_id": "bge-m3"},
+        )
+        assert r.status_code == 409
+        assert "mode=local" in r.json()["detail"]
+
+    def test_stale_start_cannot_override_stop_after_leaving_local(self, client):
+        cfg = client.get("/v1/system/config").json()
+        cfg["embedding_service_mode"] = "local"
+        cfg["embedding_service_model_id"] = "bge-m3"
+        cfg["confirm_reindex"] = "I-CONFIRM-REINDEX"
+        assert client.put("/v1/system/config", json=cfg).status_code == 200
+
+        cfg = client.get("/v1/system/config").json()
+        cfg["embedding_service_mode"] = "external"
+        cfg["confirm_reindex"] = "I-CONFIRM-REINDEX"
+        assert client.put("/v1/system/config", json=cfg).status_code == 200
+
+        from app.services.embedding_service_state import get_embedding_service_state
+        before = get_embedding_service_state().desired()
+        assert before.action == "stop"
+
+        r = client.post(
+            "/v1/system/embedding-service/start",
+            json={"model_id": "bge-m3"},
+        )
+        assert r.status_code == 409
+        after = get_embedding_service_state().desired()
+        assert after.action == "stop"
+        assert after.generation == before.generation
+
+    def test_repair_followup_start_cannot_override_newer_stop(
+        self, client, tmp_path, monkeypatch
+    ):
+        from app.services.install_progress import InstallSseStreamer
+
+        _configure_local_mode(client)
+        monkeypatch.setenv("KB_APP_ROOT", str(tmp_path))
+        monkeypatch.setattr(
+            InstallSseStreamer,
+            "events",
+            lambda self: iter(['event: status\ndata: {"phase":"accepted"}\n\n']),
+        )
+        install = client.post(
+            "/v1/system/embedding-service/install",
+            json={"model_id": "bge-m3"},
+        )
+        assert install.status_code == 200
+
+        from app.services.embedding_service_state import get_embedding_service_state
+        install_generation = get_embedding_service_state().desired().generation
+        stop = client.post("/v1/system/embedding-service/stop")
+        assert stop.status_code == 200
+
+        stale_start = client.post(
+            "/v1/system/embedding-service/start",
+            json={
+                "model_id": "bge-m3",
+                "expected_generation": install_generation,
+            },
+        )
+        assert stale_start.status_code == 409
+        desired = get_embedding_service_state().desired()
+        assert desired.action == "stop"
+        assert desired.generation == stop.json()["generation"]
+
     def test_start_bumps_action_to_start(self, client):
+        _configure_local_mode(client)
         r = client.post("/v1/system/embedding-service/start", json={"model_id": "bge-m3"})
         assert r.status_code == 200
         body = r.json()
@@ -403,6 +549,7 @@ class TestStartStopEndpoints:
         assert body["generation"] == 1
 
     def test_start_inherits_previous_model_id(self, client):
+        _configure_local_mode(client)
         # 先 install 把 model_id 记到 desired
         client.post("/v1/system/embedding-service/start", json={"model_id": "bge-m3"})
         # 再 stop 不传 model_id，应保留 bge-m3
@@ -416,6 +563,7 @@ class TestStartStopEndpoints:
 
     def test_generation_monotonic_across_endpoints(self, client):
         """连续 start → stop → start 应让 generation 单调递增。"""
+        _configure_local_mode(client)
         g1 = client.post("/v1/system/embedding-service/start",
                          json={"model_id": "bge-m3"}).json()["generation"]
         g2 = client.post("/v1/system/embedding-service/stop").json()["generation"]
@@ -431,6 +579,7 @@ class TestStartStopEndpoints:
 def rebuild_client(client, monkeypatch):
     """rebuild 端点 fixture：注入 stub rebuild_fn 绕开真实 embedding 服务。"""
     import app.main as main_mod
+    import app.services.rebuild_runner as rebuild_mod
     from app.services.rebuild_runner import get_rebuild_runner
 
     # 每次 reset runner 单例 + maintenance flag
@@ -444,6 +593,9 @@ def rebuild_client(client, monkeypatch):
     # FileExistsError（同一秒钟两次默认 TS 相同）
     monkeypatch.setattr(main_mod, "_BACKUP_FN_OVERRIDE", lambda s, d: None)
     monkeypatch.setattr(main_mod, "_RESTORE_FN_OVERRIDE", lambda b, q: None)
+    # _configure_local_mode 会 live reload repo.vector_index 为 ApiEmbedding；若不
+    # stub probe，这组单测会偷连开发机 7687，结果随本机 Embedding 是否运行漂移。
+    monkeypatch.setattr(rebuild_mod, "_default_embedding_probe", lambda _vi: None)
     return client
 
 
@@ -555,7 +707,16 @@ class TestSwitchModelEndpoint:
         )
         assert r.status_code == 400
 
+    def test_switch_rejected_outside_local_mode(self, client):
+        r = client.post(
+            "/v1/system/embedding-service/switch-model",
+            json={"model_id": "bge-m3", "confirm": "I-CONFIRM-OVERWRITE"},
+        )
+        assert r.status_code == 409
+        assert "mode=local" in r.json()["detail"]
+
     def test_switch_bumps_desired_with_action(self, client):
+        _configure_local_mode(client)
         r = client.post(
             "/v1/system/embedding-service/switch-model",
             json={
@@ -887,11 +1048,14 @@ class TestEndToEndFlow:
     def test_install_then_start_then_actual_state_visible_in_status(
         self, client, tmp_path, monkeypatch,
     ):
-        import json as _json
+        from app.services.install_progress import InstallSseStreamer
+
+        _configure_local_mode(client)
         monkeypatch.setenv("KB_APP_ROOT", str(tmp_path))
-        (tmp_path / "runtime").mkdir(parents=True, exist_ok=True)
-        (tmp_path / "runtime" / "install_status.json").write_text(
-            _json.dumps({"phase": "completed"})
+        monkeypatch.setattr(
+            InstallSseStreamer,
+            "events",
+            lambda self: iter(['event: status\ndata: {"phase":"accepted"}\n\n']),
         )
 
         # 1) install bumps desired (action=install, gen=1)
@@ -930,6 +1094,7 @@ class TestEndToEndFlow:
     def test_switch_then_rebuild_then_status_full_loop(
         self, rebuild_client, monkeypatch,
     ):
+        _configure_local_mode(rebuild_client)
         # 1) switch-model bumps desired
         r = rebuild_client.post(
             "/v1/system/embedding-service/switch-model",

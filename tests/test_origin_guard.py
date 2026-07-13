@@ -34,7 +34,7 @@ def _upsert(client, headers=None):
             "project": "p",
             "type": "fact",
             "content_markdown": "c",
-            "author": "test-user",
+            "author": "wzt",
         },
         headers=headers or {},
     )

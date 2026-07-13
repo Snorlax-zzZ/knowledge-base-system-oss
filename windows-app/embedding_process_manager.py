@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -304,6 +305,30 @@ class KbApiClient:
             payload=snapshot.to_payload(),
         )
 
+    def post_start_cas(
+        self,
+        *,
+        expected_generation: int,
+        model_id: str = "",
+        device: str = "",
+    ) -> dict[str, Any]:
+        """CAS POST /start (v2 P0-3 chaining flag pattern).
+
+        携带 expected_generation 让服务端 CAS 判 install→start promote 是否有效。
+        409 → 抛 KbApiConflict, caller 静默处理 (install→start 期间用户切 mode 是合法路径)。
+        对齐 Mac Swift `client.postStart(expectedGeneration:...)`。
+        """
+        payload: dict[str, Any] = {"expected_generation": expected_generation}
+        if model_id:
+            payload["model_id"] = model_id
+        if device:
+            payload["device"] = device
+        return self._do(
+            "POST",
+            "/v1/system/embedding-service/start",
+            payload=payload,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Action handler 协议（Batch C/D/E 实现真正动作；Batch B 只定义接口）
@@ -317,27 +342,29 @@ class ActionHandler:
     分别注入）。所有方法默认抛 NotImplementedError；未实现的 action 在
     reconcile loop 内被吃掉 + 写 last_error。
 
-    方法返回新的 ActualStateSnapshot（reconcile loop 据此更新 + 回写）。
+    v2 (P0-1): 方法返回 ``(ActualStateSnapshot, succeeded: bool)`` 元组。
+    succeeded 反映真实业务结果 (install ok / start ok / stop ok / switch_model ok),
+    不是"handler 是否抛异常"。dispatch 用 succeeded 决定是否推进 ack_generation。
     """
 
     def install(
         self, desired: DesiredStateSnapshot, current: ActualStateSnapshot,
-    ) -> ActualStateSnapshot:
+    ) -> tuple[ActualStateSnapshot, bool]:
         raise NotImplementedError("install handler 未实现（Batch C）")
 
     def start(
         self, desired: DesiredStateSnapshot, current: ActualStateSnapshot,
-    ) -> ActualStateSnapshot:
+    ) -> tuple[ActualStateSnapshot, bool]:
         raise NotImplementedError("start handler 未实现（Batch D）")
 
     def stop(
         self, desired: DesiredStateSnapshot, current: ActualStateSnapshot,
-    ) -> ActualStateSnapshot:
+    ) -> tuple[ActualStateSnapshot, bool]:
         raise NotImplementedError("stop handler 未实现（Batch E）")
 
     def switch_model(
         self, desired: DesiredStateSnapshot, current: ActualStateSnapshot,
-    ) -> ActualStateSnapshot:
+    ) -> tuple[ActualStateSnapshot, bool]:
         raise NotImplementedError("switch_model handler 未实现（Batch E）")
 
     def self_heal_warmup_if_needed(
@@ -423,6 +450,59 @@ class EmbeddingProcessManager:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
+        # v2 P0-3: install→start chaining flag (对齐 Mac Swift `startAfterInstallRequested`
+        # EmbeddingProcessManager.swift:1126,1222-1230). tray 手动/auto-bootstrap 路径
+        # SHALL 在 POST /install 前 set(True), install dispatch 成功后 _tick 层 consume
+        # (读并清 flag), 若 True → CAS POST /start.
+        # 绝对不允许 tray header-only install 后立即主动 CAS POST /start
+        # (会复活历史 commit 079c9bc 修过的 tray 抢跑 bug, 与 Mac 端 chaining 逻辑冲突)
+        self._start_after_install_lock = threading.Lock()
+        self._start_after_install_requested = False
+
+        # 若 handler 支持 lifecycle hooks (EmbeddingActionHandler 有 bind_lifecycle_hooks),
+        # 注入 stop_event + interim publisher。RecordingHandler 等测试替身不实现该方法,
+        # 静默跳过保证 backward-compat。对齐 Mac Swift ``isStopping()`` + interim writeActual。
+        bind = getattr(handler, "bind_lifecycle_hooks", None)
+        if callable(bind):
+            bind(
+                stop_event=self._stop_event,
+                publish_interim=self._publish_interim_actual,
+            )
+
+    def set_start_after_install_requested(self, requested: bool) -> None:
+        """v2 P0-3 (对齐 Mac Swift `setStartAfterInstallRequested`).
+
+        tray 手动路径 `_do_start_embedding` / auto-bootstrap 路径 `_do_auto_bootstrap_embedding`
+        在 POST `/install` 前调 set(True), 让 `_tick` 层 dispatch install 成功后能自动 chain
+        POST `/start` (携带 install 时的 expected_generation), 避免 tray 主动抢跑覆盖单槽 desired。
+        """
+        with self._start_after_install_lock:
+            self._start_after_install_requested = requested
+
+    def consume_start_after_install_request(self) -> bool:
+        """读并清 flag, 返回是否需要 chain start (对齐 Mac Swift `consumeStartAfterInstallRequest`).
+
+        `_tick` 层 dispatch install 成功后调, 返 True → CAS POST /start; 返 False → no-op。
+        """
+        with self._start_after_install_lock:
+            was_requested = self._start_after_install_requested
+            self._start_after_install_requested = False
+            return was_requested
+
+    def _publish_interim_actual(self, snap: ActualStateSnapshot) -> None:
+        """handler 在长阻塞点 (start pre-spawn 等) 主动推 warming/interim 状态。
+
+        - 不推进 acknowledged_generation (handler 已在 snap 里设好)
+        - 409/401 吃掉;5xx 只 debug log 不 bump backoff (tick 主循环有兜底)
+        对齐 Mac ``writeActual(desired: acknowledgeDesired: false)``。
+        """
+        try:
+            self._client.post_actual(snap)
+        except (KbApiConflict, KbApiUnauthorized):
+            pass
+        except KbApiTransportError as e:
+            logger.debug("interim publish transport error: %s", e)
+
     # ---- 公共接口 ---------------------------------------------------------
 
     def start(self) -> None:
@@ -484,7 +564,6 @@ class EmbeddingProcessManager:
 
         try:
             desired = self._client.get_desired()
-            self._backoff = 0.0
         except KbApiUnauthorized:
             # token invalidate 已在 client 内完成；下一 tick 会重读 → 不退避
             return
@@ -493,18 +572,76 @@ class EmbeddingProcessManager:
             self._bump_backoff()
             return
 
+        # stop() 可能在阻塞的 GET 期间置位；请求返回后必须再次检查，避免退出窗口
+        # 新派发 install/start 并留下 pip/download 或 infinity 孤儿进程。
+        if self._stop_event.is_set():
+            return
+
         if self._should_skip(desired):
+            # get_desired 成功 + 无需 dispatch → 重置退避，再走心跳。
+            self._backoff = 0.0
             self._maybe_heartbeat(desired)
             return
 
-        # 执行动作
-        new_actual = self._dispatch(desired)
+        # 执行动作；handler 抛异常 → completed=False，保留 desired 供下轮重试。
+        new_actual, completed = self._dispatch(desired)
         with self._actual_lock:
             self._actual = new_actual
 
-        # 标记 done（即使 dispatch 内部失败也要标记，避免死循环重试无效 action）
-        self._last_done_generation = desired.generation
-        self._write_actual(desired)
+        if completed and desired.action == "install":
+            # 与 Mac dispatch 语义一致：install→start chaining 属于同一次业务动作。
+            # 临时 token/传输失败时不能先 ack install，否则同 generation 永久跳过。
+            completed = self._chain_start_if_requested(desired)
+
+        if completed:
+            self._last_done_generation = desired.generation
+            self._write_actual(desired)
+        else:
+            # 对齐 Mac tick：dispatch 失败不推进 lastDoneGeneration、不 ack desired，
+            # 让下轮拉到同一 desired 重试；同时指数退避避免热循环。
+            self._bump_backoff()
+            self._write_actual(desired, acknowledge_desired=False)
+
+    def _chain_start_if_requested(self, install_desired: DesiredStateSnapshot) -> bool:
+        """v2 P0-3: install dispatch 成功后, consume chain flag → CAS POST /start.
+
+        携带 `expected_generation=install_desired.generation` 让服务端 CAS 判 install→start
+        promote 是否有效。返回值属于 install 的业务完成结果：409 表示旧 install 已终结，
+        临时网络/token 失败则恢复 flag 并返回 False，让同 generation 下轮幂等重试。
+        """
+        if not self.consume_start_after_install_request():
+            return True
+        if self._stop_event.is_set():
+            return False
+        try:
+            self._client.post_start_cas(
+                expected_generation=install_desired.generation,
+                model_id=install_desired.model_id,
+                device=install_desired.device,
+            )
+            logger.info(
+                "chain start: CAS POST /start ok, expected_generation=%d, model_id=%s",
+                install_desired.generation, install_desired.model_id,
+            )
+            return True
+        except KbApiConflict:
+            # 409: install→start 期间用户切 mode → desired 已变, 静默 (下轮 tick 走新分支)
+            logger.info(
+                "chain start: CAS 409 (desired changed during install→start), letting next tick handle",
+            )
+            return True
+        except (KbApiUnauthorized, KbApiTransportError) as e:
+            self.set_start_after_install_requested(True)
+            with self._actual_lock:
+                self._actual.last_error = f"install completed but chained start POST failed: {e}"
+            logger.warning("chain start: CAS POST /start failed: %s", e)
+            return False
+        except Exception as e:  # noqa: BLE001
+            self.set_start_after_install_requested(True)
+            with self._actual_lock:
+                self._actual.last_error = f"install completed but chained start POST failed: {e}"
+            logger.exception("chain start: unexpected error")
+            return False
 
     def _self_heal_warmup(self) -> None:
         """委托 handler 检查是否需要清 warmup 脏态；脏 → 锁内替换并立即回写。
@@ -548,32 +685,47 @@ class EmbeddingProcessManager:
             return True
         return desired.generation <= self._last_done_generation
 
-    def _dispatch(self, desired: DesiredStateSnapshot) -> ActualStateSnapshot:
-        """按 action 分发到 handler；handler 异常吞 + 写 last_error。"""
+    def _dispatch(self, desired: DesiredStateSnapshot) -> tuple[ActualStateSnapshot, bool]:
+        """按 action 分发到 handler，返回 ``(new_actual, completed)``。
+
+        v2 (P0-1): handler 统一返回 ``(snapshot, succeeded: bool)`` 元组,
+        succeeded 反映**真实业务结果**(install ok / start ok / stop ok / switch_model ok),
+        不是 "handler 是否抛异常"。
+
+        completed 计算:
+        - handler 抛异常 / unknown action / NotImplementedError: completed=False
+        - handler 返 (snapshot, False): 业务失败 (e.g. install False, spawn 早夭,
+          stop 后进程仍存活), completed=False, tick 层保留 desired 供重试 + bump backoff
+        - handler 返 (snapshot, True): 业务成功 (含 warmup timeout 活 handle = start 接管成功
+          等待 self_heal 消化), completed=True, tick 层推进 ack_generation
+
+        对齐 Mac Swift ``dispatch(desired:) -> Bool`` (EmbeddingProcessManager.swift:1571-1627)
+        用 Bool 贯穿真实业务结果的语义。
+        """
         with self._actual_lock:
             current = ActualStateSnapshot(**asdict(self._actual))
         try:
             if desired.action == "install":
-                new_actual = self._handler.install(desired, current)
+                new_actual, succeeded = self._handler.install(desired, current)
             elif desired.action == "start":
-                new_actual = self._handler.start(desired, current)
+                new_actual, succeeded = self._handler.start(desired, current)
             elif desired.action == "stop":
-                new_actual = self._handler.stop(desired, current)
+                new_actual, succeeded = self._handler.stop(desired, current)
             elif desired.action == "switch_model":
-                new_actual = self._handler.switch_model(desired, current)
+                new_actual, succeeded = self._handler.switch_model(desired, current)
             else:
                 current.last_error = f"unknown action: {desired.action}"
-                return current
+                return current, False
         except NotImplementedError as e:
             current.last_error = f"handler not implemented: {e}"
-            return current
+            return current, False
         except Exception as e:  # noqa: BLE001
             logger.exception("action handler %s failed", desired.action)
             current.last_error = f"{desired.action} failed: {e}"[:512]
-            return current
-        # handler 必须填好 acknowledged_generation；这里兜底
-        new_actual.acknowledged_generation = desired.generation
-        return new_actual
+            return current, False
+        # ack 只能由 tick 在整个业务动作（含 install→start chaining）完成后推进。
+        # 这里提前写 generation 会让 chaining 临时失败也被误判为已完成。
+        return new_actual, succeeded
 
     def _maybe_heartbeat(self, desired: DesiredStateSnapshot) -> None:
         """无动作执行时仍按 ``heartbeat_sec`` 心跳回写 actual-state。
@@ -586,17 +738,39 @@ class EmbeddingProcessManager:
             return
         self._write_actual(desired)
 
-    def _write_actual(self, desired: DesiredStateSnapshot) -> None:
-        """带最新 generation 回写 actual-state；409/401 吃掉，5xx 退避。"""
+    def _write_actual(
+        self,
+        desired: DesiredStateSnapshot,
+        acknowledge_desired: bool = True,
+    ) -> None:
+        """带最新 generation 回写 actual-state；409/401 吃掉，5xx 退避。
+
+        ``acknowledge_desired``: dispatch 成功 / 心跳 / skip 默认走 True → 让
+        kb-api 看到本 generation 已消化；dispatch 失败时 tick 层传 False → 只
+        写 ``_last_done_generation`` 兜底 ack，不推进 desired.generation 也不
+        清 backoff，保留本 desired 供后续 tick 重试。对齐 Mac Swift
+        ``writeActual(desired:acknowledgeDesired:)``（EmbeddingProcessManager.swift:1828）。
+        """
         with self._actual_lock:
             snap = ActualStateSnapshot(**asdict(self._actual))
+        # _last_done_generation 是历史 handler 已 ack 下限，任何情况都要写。
         snap.acknowledged_generation = max(
-            snap.acknowledged_generation, self._last_done_generation, desired.generation,
+            snap.acknowledged_generation, self._last_done_generation,
         )
+        if acknowledge_desired:
+            snap.acknowledged_generation = max(
+                snap.acknowledged_generation, desired.generation,
+            )
         try:
             self._client.post_actual(snap)
+            with self._actual_lock:
+                self._actual.acknowledged_generation = max(
+                    self._actual.acknowledged_generation,
+                    snap.acknowledged_generation,
+                )
             self._last_heartbeat_at = self._clock()
-            self._backoff = 0.0
+            if acknowledge_desired:
+                self._backoff = 0.0
         except KbApiConflict:
             # 心跳时 generation 落后 → 下次 tick 拉到新 desired 后会重写
             logger.debug("actual-state 409 conflict; dropping this heartbeat")
@@ -938,9 +1112,11 @@ class InstallExecutor:
           3 = numpy 版本不符合 py 版本区间约束（py>=3.10 需 numpy>=2.1；
               py<3.10 需 numpy<2 因为 infinity-emb 0.0.77 metadata 硬 upper <2）
 
-        20s timeout：venv python 冷启 1-3s + import torch 首次 5-10s（cu124 需
-        探 CUDA），保守留 20s 覆盖慢机器。命中场景下秒回。跟 Mac Swift 端
-        EmbeddingProcessManager.swift:venvDepsReady 完全同源，两端一致。
+        N6: 60s timeout + cwd 隔离 (对齐 Mac EmbeddingProcessManager.swift:690-695
+        timeout: 60.0, cwd: serviceDir)。20s 在冷缓存机器上探 CUDA 时会稳定超时误报
+        repair (08.2.1 实测 21.03s), 保守 60s 覆盖 GPU cold-start / import torch 慢机。
+        cwd 隔离让 subprocess 从 embedding-service 目录起 (venv 父目录), 避免继承
+        奇怪的 CWD 导致 sys.path 相对 import 走偏。
         """
         venv_python = _find_venv_python(spec.venv_dir)
         if venv_python is None:
@@ -971,9 +1147,12 @@ class InstallExecutor:
             "sys.exit(0)\n"
         )
         probe_cmd = [venv_python, "-c", probe_script]
+        # N6: cwd = venv 父目录 (embedding-service 目录), 避免继承外部 cwd 影响
+        # sys.path 相对 import; timeout 60s 覆盖冷缓存 CUDA 探测 (Mac 侧同步)
+        probe_cwd = str(Path(spec.venv_dir).parent)
         try:
             result = self._runner.run(
-                probe_cmd, log_path=self._pip_log_path, timeout=20.0,
+                probe_cmd, cwd=probe_cwd, log_path=self._pip_log_path, timeout=60.0,
             )
         except Exception:  # noqa: BLE001 — 探测失败退回 pip 路径，不影响正确性
             return False
@@ -1161,7 +1340,7 @@ class ProcessHandle:
     def terminate(self) -> None:
         raise NotImplementedError
 
-    def kill(self) -> None:
+    def kill(self) -> bool:
         raise NotImplementedError
 
 
@@ -1187,11 +1366,14 @@ class _PopenProcessHandle(ProcessHandle):
         except OSError:
             pass
 
-    def kill(self) -> None:
+    def kill(self) -> bool:
         try:
             self._proc.kill()
+            return True
+        except ProcessLookupError:
+            return True
         except OSError:
-            pass
+            return False
 
 
 class SubprocessSpawner:
@@ -1290,6 +1472,11 @@ class StartSpec:
     # plan.env 透传：infinity 子进程必需的 env（如 INFINITY_BETTERTRANSFORMER=false
     # 关掉 bettertransformer 探测，否则会撞 NameError(BetterTransformerManager)）
     env: dict[str, str] = field(default_factory=dict)
+    # v2 P0-4: cmdline 里 --model-id 参数的实际值（resolved 绝对路径, e.g.
+    # "D:\KnowledgeBase\models\bge-m3"）, 用于 adopt cmdline 归属判定。
+    # None → adopt 判定回落到 model_id 逻辑 key (向后兼容, 但可能因逻辑 key vs 绝对路径
+    # mismatch 导致自家进程被判外人 → spec_factory 生成 StartSpec 时应主动填 resolved 路径)
+    cmdline_model_value: Optional[str] = None
 
 
 # 健康探活默认超时（秒）。AC24 分级就绪：单次探活 ≤2s，整个 warmup 上限独立配。
@@ -1329,12 +1516,23 @@ class StartHandler:
         """供 EmbeddingActionHandler 在 self-heal 路径里复用同一份 probe。"""
         return self._probe
 
-    def spawn_and_wait_ready(self, spec: StartSpec) -> tuple[Optional[ProcessHandle], bool, str]:
+    def spawn_and_wait_ready(
+        self,
+        spec: StartSpec,
+        on_spawn: Optional[Callable[[ProcessHandle], None]] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> tuple[Optional[ProcessHandle], bool, str]:
         """spawn + 探活；返回 ``(handle, ready, last_error)``。
 
-        - ``handle`` is None 表示 spawn 直接失败
+        - ``handle`` is None 表示 spawn 直接失败 / warmup 期间被 stop_event 打断 / warmup 超时
+          （超时会 terminate 子进程再返回 None，对齐 Mac ``doStart`` warmup timeout 分支）
         - ``ready`` 即 warming_up 是否已结束
         - ``last_error`` 为空串表示正常
+        - ``on_spawn``: spawn 成功后立即回调，让 caller 早登记 handle 到 ``_current_handle``，
+          防止 warmup 期间 tray quit 时 shutdown 看不到 handle → 遗留 orphan
+          （对齐 Mac ``spawnAndWaitReady(_, onSpawn:)``）
+        - ``stop_event``: warmup 轮询期间每次 tick 都检查，触发时 terminate handle
+          并返回 ``(None, False, "warmup interrupted by stop_event")``
         """
         try:
             handle = self._spawner.spawn(
@@ -1346,6 +1544,13 @@ class StartHandler:
             logger.exception("spawn infinity failed")
             return None, False, f"spawn failed: {e}"[:512]
 
+        # G2: 早登记 handle 让 EmbeddingActionHandler 在 warmup 期间就能被 shutdown 看到
+        if on_spawn is not None:
+            try:
+                on_spawn(handle)
+            except Exception:  # noqa: BLE001
+                logger.exception("on_spawn callback failed; continuing warmup")
+
         # 写 pid / port（壳层下次启动靠这两份文件清残留）
         try:
             spec.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -1356,6 +1561,14 @@ class StartHandler:
 
         deadline = self._clock() + self._warmup_timeout_sec
         while self._clock() < deadline:
+            # N7: warmup 期间收到 stop_event → 立即 terminate + 返回 None
+            if stop_event is not None and stop_event.is_set():
+                try:
+                    handle.terminate()
+                except Exception:  # noqa: BLE001
+                    logger.warning("stop_event terminate handle failed", exc_info=True)
+                return None, False, "warmup interrupted by stop_event"
+
             # 子进程异常早夭 → 立即返回 spawn 失败
             exit_code = handle.poll()
             if exit_code is not None:
@@ -1363,7 +1576,11 @@ class StartHandler:
             if self._probe.is_ready(spec.port):
                 return handle, True, ""
             self._sleep(self._probe_interval_sec)
-        # 超时：进程还活着但还在 warming → 返回 handle，让 manager 后续 tick 继续观测
+        # v2 修法 (P0-2): warmup 超时 SHALL **保留活 handle**, 不主动 terminate
+        # 返回 (handle, False, "warmup timeout after Xs") 让 caller 保 warming_up=True
+        # 由 self_heal_warmup 后续探测 /health 200 消化 warming 状态
+        # 对齐 Mac Swift `doStart` warmup timeout 分支 (EmbeddingProcessManager.swift:1759-1780)
+        # 避免慢机 120s+ warmup 被误杀 + terminate 若未生效反成 orphan 且归属证据已删的双重风险
         return handle, False, f"warmup timeout after {self._warmup_timeout_sec}s"
 
 
@@ -1374,7 +1591,6 @@ class StartHandler:
 
 # stop 退出契约（AC14a）：先 SIGTERM，3 秒不死 SIGKILL
 DEFAULT_STOP_GRACE_SEC = 3.0
-
 
 class StopHandler:
     """stop action 工作流（contract §8 / AC14a）。
@@ -1434,14 +1650,16 @@ class StopHandler:
             else:
                 error = "process did not respond to SIGKILL"
 
-        # 清残留 pid / port 文件
-        for fname in ("pid", "port"):
-            try:
-                (runtime_dir / fname).unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as e:
-                logger.warning("unlink runtime/%s failed: %s", fname, e)
+        # 只有确认进程已停止才清归属证据。SIGKILL 后仍活时保留 pid/port，
+        # 供同 generation 重试以及 tray 重启后的安全 adopt。
+        if not error:
+            for fname in ("pid", "port"):
+                try:
+                    (runtime_dir / fname).unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    logger.warning("unlink runtime/%s failed: %s", fname, e)
 
         return graceful, error
 
@@ -1466,19 +1684,106 @@ class _PsCmdlineProbe:
 
     def cmdline(self, pid: int) -> str:
         if os.name == "nt":
-            # Windows: wmic (Win10 之前) / pwsh Get-CimInstance (Win11+)。这里
-            # 用 wmic，缺则返空串（让 caller 走"未知 cmdline → 视为外人 PID"分支）
-            cmd = ["wmic", "process", "where", f"ProcessId={pid}", "get", "CommandLine", "/value"]
-        else:
-            # mac / linux: ps -p {pid} -o command= 返回完整命令行
-            cmd = ["ps", "-p", str(pid), "-o", "command="]
+            # v2 P1-5: Windows 优先 wmic (Win 10 兼容, 快), fallback
+            # PowerShell Get-CimInstance (Win 11 22H2+ wmic 已 deprecated 默认关闭).
+            # 参考: https://learn.microsoft.com/windows/deployment/planning/windows-10-deprecated-features
+            result = self._try_wmic_cmdline(pid)
+            if result:
+                return result
+            # wmic 不可用 → CIM fallback
+            return self._try_cim_cmdline(pid)
+        # mac / linux: ps -p {pid} -o command= 返回完整命令行
+        cmd = ["ps", "-p", str(pid), "-o", "command="]
         try:
-            result = self._runner.run(cmd)
+            result = self._runner.run(cmd, timeout=5.0)
         except Exception:  # noqa: BLE001
             return ""
         if result.returncode != 0:
             return ""
         return (result.stdout_tail or "").strip()
+
+    def _try_wmic_cmdline(self, pid: int) -> str:
+        """v2 P1-5: wmic 首选路径 (Win 10 快, Win 11 前默认存在)."""
+        cmd = ["wmic", "process", "where", f"ProcessId={pid}", "get", "CommandLine", "/value"]
+        try:
+            result = self._runner.run(cmd, timeout=3.0)
+        except Exception:  # noqa: BLE001
+            return ""
+        if result.returncode != 0:
+            return ""
+        for line in (result.stdout_tail or "").splitlines():
+            line = line.strip()
+            if line.startswith("CommandLine="):
+                return line.split("=", 1)[1].strip()
+        return ""
+
+    def _try_cim_cmdline(self, pid: int) -> str:
+        """v2 P1-5: PowerShell Get-CimInstance fallback (Win 11 22H2+ wmic 已 deprecated).
+
+        `Get-CimInstance Win32_Process -Filter "ProcessId=$pid" | Select-Object -ExpandProperty CommandLine`
+        输出纯 CommandLine 字符串。找不到 / powershell 不可用 → 返空串。
+        """
+        ps_script = (
+            f"Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" "
+            f"| Select-Object -ExpandProperty CommandLine"
+        )
+        cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script]
+        try:
+            result = self._runner.run(cmd, timeout=5.0)
+        except Exception:  # noqa: BLE001
+            return ""
+        if result.returncode != 0:
+            return ""
+        return (result.stdout_tail or "").strip()
+
+
+def _cmdline_option_matches(cmdline: str, name: str, value: str) -> bool:
+    """检查 cmdline 里 ``--name (空格|=) value`` 是否是精确 token(非 substring)。
+
+    对齐 Mac ``commandLineContainsOption``: ``(?:^|\\s)--<name>(?:\\s+|=)"?<value>"?(?=\\s|$)``。
+    Anchor 前后避免 ``--port 7687`` 误匹配 ``--port 76870``, 支持三种形式:
+    - ``--name value`` (空格分隔, unquoted)
+    - ``--name=value`` (等号分隔, unquoted)
+    - ``--name "C:\\path with spaces\\model"`` (v2 P0-4: quoted 支持带空格路径)
+    - ``--name="C:\\path with spaces\\model"`` (v2 P0-4: 等号 + quoted)
+    """
+    if not cmdline or not name or not value:
+        return False
+    # v2 P0-4: value 前后可选双引号支持 quoted 路径 (适配 --model-id "D:\KB\models\bge-m3")
+    pat = rf'(?:^|\s){re.escape(name)}(?:\s+|=)"?{re.escape(value)}"?(?=\s|$)'
+    return re.search(pat, cmdline) is not None
+
+
+def _owned_infinity_cmdline_matches(
+    cmdline: str, expected_model_value: str, expected_port: int,
+) -> bool:
+    """判断 cmdline 是否是自家 infinity 进程 (model + port 精确匹配)。
+
+    G4/N5 共享: ``StaleResidueCleaner`` adopt 判定 + ``_AdoptedHandle`` 发信号前
+    的 owner 校验都走它, 消灭 PID 复用误杀 + 端口 substring 误匹配。
+
+    v2 P0-4: ``expected_model_value`` SHOULD 是 cmdline 里实际会出现的字符串,
+    即 **resolved 绝对模型路径** (e.g. "D:\\KnowledgeBase\\models\\bge-m3"), 不是逻辑
+    key "bge-m3" —— 不然自家进程会被判为外人 (cmdline 里 --model-id 是绝对路径,
+    传逻辑 key match 不上). caller SHOULD 传 ``spec.cmdline_model_value``, fallback
+    到 ``desired.model_id``.
+    """
+    if not cmdline or "infinity" not in cmdline:
+        return False
+    return (
+        _cmdline_option_matches(cmdline, "--port", str(expected_port))
+        and _cmdline_option_matches(cmdline, "--model-id", expected_model_value)
+    )
+
+
+def _try_unlink(runtime_dir: Optional[Path], name: str) -> None:
+    """runtime/pid|port 尽量清；找不到 / 无权限吞掉。"""
+    if runtime_dir is None:
+        return
+    try:
+        (runtime_dir / name).unlink(missing_ok=True)
+    except OSError as e:
+        logger.debug("unlink %s failed: %s", name, e)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1493,9 +1798,13 @@ def _pid_alive(pid: int) -> bool:
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
                 capture_output=True, text=True, timeout=2.0,
             )
+            if out.returncode != 0:
+                # 查询失败是 unknown，不得当作 dead 后删除 ownership hints。
+                return True
             return str(pid) in out.stdout
         except Exception:  # noqa: BLE001
-            return False
+            # 保守视作存活；下游 ownership probe 仍会阻止误发信号。
+            return True
     # POSIX: kill -0 不实际发信号，只校验
     try:
         os.kill(pid, 0)
@@ -1506,7 +1815,8 @@ def _pid_alive(pid: int) -> bool:
         # 进程存在但是别的用户的；视作存活
         return True
     except OSError:
-        return False
+        # 非 ProcessLookupError 的探测错误属于 unknown，保守视作存活。
+        return True
 
 
 class StaleResidueCleaner:
@@ -1551,13 +1861,12 @@ class StaleResidueCleaner:
             self._unlink("port")
             return None, None
 
-        # PID 活着：检查是不是自己人
+        # PID 活着：检查是不是自己人 (G4 正则边界防 --port 7687 匹配 --port 76870)
         cmdline = self._probe.cmdline(pid)
-        # 复用 app/services/embedding_install.is_owned_infinity 的判定，但
-        # 壳层不直接 import kb-api 包，简化为内联实现
-        if cmdline and "infinity" in cmdline and (
-            port is not None and f"--port {port}" in cmdline
-        ) and f"--model-id {expected_model_id}" in cmdline:
+        if (
+            port is not None
+            and _owned_infinity_cmdline_matches(cmdline, expected_model_id, port)
+        ):
             # 自家 infinity，adopt
             return pid, port
         # 外人占了：不动它，让 caller 换端口
@@ -1629,6 +1938,31 @@ class EmbeddingActionHandler(ActionHandler):
         self._current_handle: Optional[ProcessHandle] = None
         self._restart_count = 0
 
+        # G2/N7/N9 lifecycle hooks:由 manager 在构造后通过 bind_lifecycle_hooks 注入。
+        # 默认 None / no-op 保证独立单测 (不经 manager) 也能跑。
+        self._stop_event: Optional[threading.Event] = None
+        self._publish_interim: Callable[[ActualStateSnapshot], None] = lambda snap: None
+
+    def _is_stopping(self) -> bool:
+        return self._stop_event is not None and self._stop_event.is_set()
+
+    def bind_lifecycle_hooks(
+        self,
+        *,
+        stop_event: threading.Event,
+        publish_interim: Callable[[ActualStateSnapshot], None],
+    ) -> None:
+        """由 ``EmbeddingProcessManager.__init__`` 在双方构造完成后调用。
+
+        - ``stop_event``: warmup 期间轮询检查,set 时立即清理 handle + pid/port
+          + 让 spawn_and_wait_ready 收到相同 event 直接终止子进程
+        - ``publish_interim``: N9 pre-spawn 主动把 warming_up=True 快照推到 kb-api,
+          避免 UI 在 120s warmup 期间看到 installed=false 误报"未安装"
+        对齐 Mac ``isStopping()`` 闭包 + ``writeActual(acknowledgeDesired: false)``。
+        """
+        self._stop_event = stop_event
+        self._publish_interim = publish_interim
+
     # ---- 当前句柄查询（manager supervise 用） ---------------------------
 
     @property
@@ -1648,34 +1982,60 @@ class EmbeddingActionHandler(ActionHandler):
     # ---- ActionHandler 协议实现 ---------------------------------------
 
     def install(self, desired, current):
+        """install action。返回 ``(snapshot, succeeded)``。
+
+        succeeded=False 时 tick 层不推 ack_generation, 下轮同 generation 重试。
+        对齐 Mac Swift `dispatch install` 用真实业务 bool 决定 ack (P0-1)。
+        """
         ctx = self._spec_factory(desired, current)
         if ctx.install_spec is None:
             current.last_error = "install spec missing"
-            return current
+            return current, False
         ok = self._installer.execute(ctx.install_spec)
         current.installed = ok
         current.model_id = desired.model_id
         current.device = desired.device
         current.last_error = "" if ok else "install failed (see install_status.json)"
-        return current
+        return current, ok
 
     def start(self, desired, current):
+        """start action。返回 ``(snapshot, succeeded)``。
+
+        - spec 缺失 / 端口 stale / spawn 失败 / adopt 后早 stop → succeeded=False
+        - adopt 成功 / spawn 成功且 ready=True → succeeded=True
+        - warmup timeout **保留活 handle** (对齐 Mac Swift `doStart` L1759-1780)
+          → succeeded=True (start 已接管成功, self_heal_warmup 兜底消化 warming 状态)
+        对齐 v2 修法翻回 Mac 语义 (P0-2, spec.md handle 生命周期契约)。
+        """
         # 1) 启动前清残留
         ctx = self._spec_factory(desired, current)
         start_spec = ctx.start_spec
         if start_spec is None:
             current.last_error = "start spec missing"
-            return current
+            return current, False
 
-        adopt_pid, stale_port = self._cleaner.adopt_or_clean(desired.model_id)
+        # v2 P0-4: 传 cmdline_model_value (resolved 绝对路径) 而不是 desired.model_id
+        # (逻辑 key), 让 cmdline 归属判定能匹配真实 cmdline 里的 --model-id 绝对路径
+        expected_model_for_cmdline = start_spec.cmdline_model_value or desired.model_id
+        adopt_pid, stale_port = self._cleaner.adopt_or_clean(expected_model_for_cmdline)
         if adopt_pid is not None:
             # 上次自己留下的 infinity 仍在跑 → 直接 adopt，不重 spawn
+            # N5: 带 expected_model_id + expected_port,handle 每次 signal 前 cmdline 校验
+            # v2 P0-4: expected_port 用 cleaner 从 runtime/port 读到的 stale_port (真实运行 port)
+            # 而不是 start_spec.port (新分配的期望 port), 避免 signal 前 cmdline 校验因 port
+            # mismatch 判为外人 (adopted 进程实际用的 port 就是 stale_port).
+            actual_port = stale_port if stale_port is not None else start_spec.port
+            adopted_handle = _AdoptedHandle(
+                pid=adopt_pid,
+                expected_model_id=expected_model_for_cmdline,
+                expected_port=actual_port,
+            )
             with self._lock:
-                self._current_handle = _AdoptedHandle(pid=adopt_pid)
+                self._current_handle = adopted_handle
             current.running = True
             current.warming_up = False  # adopt 来的视作已就绪（adopt 前 cmdline 校验过）
             current.pid = adopt_pid
-            current.port = start_spec.port
+            current.port = actual_port  # v2 P0-4: 用真实运行 port, 不是 start_spec.port
             current.model_id = desired.model_id
             # adopt 能拿到 infinity handle 说明模型 + venv 都在盘上：filesystem
             # 层面必然装好，回补 installed=True 让 kb-api 视图跟真实盘状一致。
@@ -1683,26 +2043,161 @@ class EmbeddingActionHandler(ActionHandler):
             # _actual.installed 永远停在 False，UI 显示"未安装" 但服务已在跑。
             current.installed = True
             current.last_error = ""
-            return current
+            # G2 for adopt path: stop 可能在 cleaner 校验完成、_current_handle
+            # 登记前抢先看到 nil；登记后再检查一次 stop_event，退出已开始 → kill。
+            if self._is_stopping():
+                # 始终使用本分支刚登记的本地引用。shutdown() 可能已从共享槽
+                # 取走 handle，但“共享槽为空”不等于进程已停止。
+                handle = adopted_handle
+                stopped = False
+                try:
+                    # shutdown() 已在 handle 登记前错过这条进程；退出窗口不再走
+                    # graceful terminate，直接 force-kill（对齐 Mac adopt race）。
+                    stopped = bool(handle.kill())
+                except Exception:  # noqa: BLE001
+                    logger.warning("adopt path force-kill raised", exc_info=True)
+
+                if stopped:
+                    with self._lock:
+                        if self._current_handle is handle:
+                            self._current_handle = None
+                    for fname in ("pid", "port"):
+                        _try_unlink(ctx.runtime_dir, fname)
+                    current.running = False
+                    current.warming_up = False
+                    current.pid = None
+                    current.last_error = ""
+                else:
+                    # 强杀失败：保留内存 handle 与磁盘 PID/port，供下次 tray 启动
+                    # 继续安全 adopt/cleanup；绝不能把仍活进程伪装成已停止。
+                    with self._lock:
+                        if self._current_handle is None:
+                            self._current_handle = handle
+                    current.running = True
+                    current.warming_up = False
+                    current.pid = adopt_pid
+                    current.last_error = "adopted process still alive after force-kill"
+                    logger.error(
+                        "adopt path force-kill failed; preserving ownership hints pid=%s port=%s",
+                        adopt_pid,
+                        actual_port,
+                    )
+                # tray quit 场景, desired 仍是 start 但没完成; 不 ack 让下轮重试
+                # (下轮 reconcile loop 已停, 实际不会重试; 这个 False 只是语义正确)
+                return current, False
+            return current, True  # adopt 成功
 
         # 2) 端口 stale → caller 应在 spec_factory 里替换；这里再次保守提示
         if stale_port is not None and start_spec.port == stale_port:
             current.last_error = f"port {stale_port} stale; spec_factory 应选其他端口"
-            return current
+            return current, False
 
-        # 3) spawn + 等 ready
-        handle, ready, err = self._starter.spawn_and_wait_ready(start_spec)
-        if handle is None:
+        # 3) N9: pre-spawn 预置 warming 状态推到 kb-api，避免 UI 在 120s warmup 期间
+        # 看到 installed=false 误报"未安装"。对齐 Mac swift doStart pre-spawn writeActual。
+        preserved_ack = current.acknowledged_generation
+        interim = ActualStateSnapshot(
+            acknowledged_generation=preserved_ack,
+            installed=True,
+            running=False,
+            warming_up=True,
+            model_id=desired.model_id,
+            port=start_spec.port,
+            pid=None,
+            device=desired.device,
+            restart_count=current.restart_count,
+            last_error="",
+        )
+        try:
+            self._publish_interim(interim)
+        except Exception:  # noqa: BLE001
+            logger.debug("publish_interim (pre-spawn warming) failed", exc_info=True)
+
+        # 4) G2 on_spawn 回调 + N7 stop_event 注入 → spawn + 等 ready
+        def _on_spawn(spawned: ProcessHandle) -> None:
+            with self._lock:
+                self._current_handle = spawned
+            # spawn 与 handle 发布之间可能已触发 stop：补杀避免 orphan
+            if self._is_stopping():
+                try:
+                    spawned.terminate()
+                except Exception:  # noqa: BLE001
+                    logger.warning("on_spawn stop_event kill failed", exc_info=True)
+                for fname in ("pid", "port"):
+                    _try_unlink(ctx.runtime_dir, fname)
+
+        handle, ready, err = self._starter.spawn_and_wait_ready(
+            start_spec,
+            on_spawn=_on_spawn,
+            stop_event=self._stop_event,
+        )
+
+        # 5) N7: warmup 期间收到 stop → 清 handle + pid/port + running=False
+        if self._is_stopping():
+            with self._lock:
+                early = self._current_handle
+                self._current_handle = None
+            if early is not None and hasattr(early, "poll"):
+                try:
+                    if early.poll() is None:
+                        early.terminate()
+                except Exception:  # noqa: BLE001
+                    logger.warning("stop_event terminate early handle failed", exc_info=True)
+            elif handle is not None:
+                try:
+                    handle.terminate()
+                except Exception:  # noqa: BLE001
+                    logger.warning("stop_event terminate warmup handle failed", exc_info=True)
+            for fname in ("pid", "port"):
+                _try_unlink(ctx.runtime_dir, fname)
             current.running = False
             current.warming_up = False
-            current.last_error = err
-            return current
+            current.pid = None
+            current.last_error = ""
+            return current, False
 
+        # 6) v2 修法 (P0-2): 区分 warmup timeout 与 spawn 早夭
+        # - warmup timeout: spawn_and_wait_ready 返回 (handle, False, "warmup timeout after Xs")
+        #   活 handle 表示 start 接管成功, actual 保 warming_up=True, self_heal 后续消化
+        #   → 保留 handle + pid/port, 返 (current_with_warming, True) 让 tick 层 ack
+        # - spawn 早夭: 返回 (None, False, "spawn failed" 或 "infinity exited during warmup ...")
+        #   → 清 handle + pid/port, 返 (current_with_error, False) 让下轮重试
+        if handle is None:
+            with self._lock:
+                self._current_handle = None
+            for fname in ("pid", "port"):
+                _try_unlink(ctx.runtime_dir, fname)
+            current.running = False
+            current.warming_up = False
+            current.pid = None
+            current.port = None
+            current.last_error = err
+            return current, False
+
+        # 6.5) warmup timeout 活 handle 分支 (对齐 Mac Swift `doStart` L1759-1780)
+        if not ready and "warmup timeout" in err:
+            with self._lock:
+                if self._current_handle is not handle:
+                    self._current_handle = handle
+                preserved_restart = self._restart_count
+            current.running = True
+            current.warming_up = True  # 保 warming, self_heal_warmup 后续探测 /health 消化
+            current.pid = handle.pid
+            current.port = start_spec.port
+            current.model_id = desired.model_id
+            current.device = desired.device
+            current.installed = True
+            current.restart_count = preserved_restart
+            current.last_error = err  # 保留 "warmup timeout after Xs" 提示
+            return current, True  # start 接管成功 ack, 让 self_heal 后续消化 warming_up
+
+        # 7) 正常路径：ready=True，spawn_and_wait_ready 已经通过 on_spawn 早登记过 handle
         with self._lock:
-            self._current_handle = handle
+            # on_spawn 已登记 handle，保持一致；防御性再确认一次
+            if self._current_handle is not handle:
+                self._current_handle = handle
             preserved_restart = self._restart_count
         current.running = True
-        current.warming_up = not ready
+        current.warming_up = not ready  # 到此 ready 恒为 True (warmup timeout 已在 6.5 分支 return)
         current.pid = handle.pid
         current.port = start_spec.port
         current.model_id = desired.model_id
@@ -1715,10 +2210,19 @@ class EmbeddingActionHandler(ActionHandler):
         # restart_count 只在 stop 时归零;start 期间保留累计,supervise 触发的重启
         # 能继续往上加;用户手动 stop 后再 start 也能从 0 重新计
         current.restart_count = preserved_restart
-        current.last_error = err if not ready else ""
-        return current
+        current.last_error = ""
+        return current, True
 
     def stop(self, desired, current):
+        """stop action。返回 ``(snapshot, succeeded)``。
+
+        三态判断（对齐已验证的 Mac StopResult/doStop）:
+        - handle=None (本来就没在跑): succeeded=True (幂等)
+        - graceful=True: SIGTERM 生效 → 清 handle + succeeded=True
+        - graceful=False, err="": SIGTERM 无效但 SIGKILL 生效 → 清 handle + succeeded=True
+        - err != "": 进程仍活 → 保留 handle/PID/port + succeeded=False；tick 的封顶
+          backoff 负责限流，绝不把活进程伪装成 stopped 并 ack generation
+        """
         with self._lock:
             handle = self._current_handle
         if handle is None:
@@ -1726,11 +2230,22 @@ class EmbeddingActionHandler(ActionHandler):
             current.warming_up = False
             current.pid = None
             current.last_error = ""
-            return current
+            return current, True
 
         ctx = self._spec_factory(desired, current)
         runtime_dir = ctx.runtime_dir or Path(".")
         graceful, err = self._stopper.terminate_and_wait(handle, runtime_dir)
+
+        if err:
+            with self._lock:
+                still_alive = self._current_handle is handle
+            current.running = still_alive
+            current.warming_up = False
+            current.pid = handle.pid if still_alive else None
+            current.last_error = err
+            return current, False
+
+        # 成功停止 (graceful=True 或 SIGKILL 生效)
         with self._lock:
             self._current_handle = None
             self._restart_count = 0
@@ -1738,8 +2253,8 @@ class EmbeddingActionHandler(ActionHandler):
         current.warming_up = False
         current.pid = None
         current.restart_count = 0
-        current.last_error = err if err else ("" if graceful else "force-killed after grace")
-        return current
+        current.last_error = "" if graceful else "force-killed after grace"
+        return current, True
 
     def shutdown(self) -> None:
         """tray quit 时强制带走 infinity（与 Mac Swift 同步）。
@@ -1801,19 +2316,23 @@ class EmbeddingActionHandler(ActionHandler):
         return healed
 
     def switch_model(self, desired, current):
-        # stop -> install -> start;任一阶段失败立即返回，不再向下
-        current = self.stop(desired, current)
-        if current.running:
-            # stop 没成功停掉旧的，不切
+        """switch_model 三步串联 stop → install → start。返回 ``(snapshot, succeeded)``。
+
+        任一子步骤 succeeded=False → 立即返回该 (snapshot, False), 让下轮 tick 重试。
+        所有子步骤都 True 才整体成功。对齐 Mac Swift `dispatch switch_model` 语义。
+        """
+        current, ok = self.stop(desired, current)
+        if not ok or current.running:
+            # stop 失败或没成功停掉旧的, 不切
             current.last_error = current.last_error or "stop before switch failed"
-            return current
+            return current, False
 
-        current = self.install(desired, current)
-        if not current.installed:
-            return current
+        current, ok = self.install(desired, current)
+        if not ok or not current.installed:
+            return current, False
 
-        current = self.start(desired, current)
-        return current
+        current, ok = self.start(desired, current)
+        return current, ok
 
     # ---- 崩溃保活（manager supervise 调） --------------------------------
 
@@ -1847,10 +2366,10 @@ class EmbeddingActionHandler(ActionHandler):
             current.restart_count = cnt
             return current
 
-        # 尝试重启
+        # 尝试重启 (v2: start 已改成返 tuple, supervise_tick 只关心 snapshot)
         with self._lock:
             self._restart_count = cnt + 1
-        new_current = self.start(desired, current)
+        new_current, _ = self.start(desired, current)
         new_current.restart_count = cnt + 1
         return new_current
 
@@ -1869,28 +2388,91 @@ class EmbeddingActionContext:
 
 
 class _AdoptedHandle(ProcessHandle):
-    """adopt 来的 PID 没有 Popen 对象；用 ``_pid_alive`` 做 poll 兜底。"""
+    """adopt 来的 PID 没有 Popen 对象；每次操作前 (poll/terminate/kill) 都要
+    校验 cmdline 仍匹配 ``expected_model_id + expected_port``,防 PID 复用误杀
+    (N5, 对齐 Mac ``InfinityProcess.adoptedProcessIsStillOwned``)。
+    """
 
-    def __init__(self, pid: int) -> None:
+    def __init__(
+        self,
+        pid: int,
+        *,
+        expected_model_id: str = "",
+        expected_port: int = 0,
+        cmdline_probe: Optional[_PsCmdlineProbe] = None,
+    ) -> None:
         self.pid = pid
+        self._expected_model_id = expected_model_id
+        self._expected_port = expected_port
+        self._probe = cmdline_probe or _PsCmdlineProbe()
+
+    def _ownership_state(self) -> str:
+        """返回 ``dead/owned/foreign/unknown``，不把查询失败伪装成死亡。"""
+        if not _pid_alive(self.pid):
+            return "dead"
+        if not self._expected_model_id or self._expected_port <= 0:
+            # 兜底: 无 expected info(旧代码路径 / 测试构造) 只做 PID 存活
+            return "owned"
+        cmdline = self._probe.cmdline(self.pid)
+        if not cmdline:
+            return "unknown"
+        if _owned_infinity_cmdline_matches(
+            cmdline, self._expected_model_id, self._expected_port,
+        ):
+            return "owned"
+        return "foreign"
+
+    def _still_owned(self) -> bool:
+        """PID 存活 AND cmdline 仍是自家 infinity。任一失败 → 不再发信号。"""
+        return self._ownership_state() == "owned"
 
     def poll(self) -> Optional[int]:
-        return None if _pid_alive(self.pid) else -1
+        state = self._ownership_state()
+        # owner query 暂时失败时只能判 unknown，不能让 StopHandler 当作已退出
+        # 并删除 pid/port；foreign/dead 才可视为不再由本 handle 管理。
+        return None if state in {"owned", "unknown"} else -1
 
     def terminate(self) -> None:
+        if not self._still_owned():
+            # PID 已复用为外人,或 cmdline 变了 → 不发信号防误杀
+            return
         if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(self.pid)], capture_output=True)
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(self.pid)],
+                    capture_output=True,
+                    timeout=5.0,
+                )
+            except Exception:  # noqa: BLE001
+                pass
         else:
             try:
                 os.kill(self.pid, 15)  # SIGTERM
             except OSError:
                 pass
 
-    def kill(self) -> None:
+    def kill(self) -> bool:
+        state = self._ownership_state()
+        if state == "dead":
+            return True
+        if state != "owned":
+            # foreign/unknown 都拒绝发信号，并让 caller 保留 hints 后续重核。
+            return False
         if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.pid)], capture_output=True)
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(self.pid)],
+                    capture_output=True,
+                    timeout=5.0,
+                )
+            except Exception:  # noqa: BLE001
+                return False
+            return result.returncode == 0
         else:
             try:
                 os.kill(self.pid, 9)  # SIGKILL
+                return True
+            except ProcessLookupError:
+                return True
             except OSError:
-                pass
+                return False

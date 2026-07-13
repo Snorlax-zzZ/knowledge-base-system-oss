@@ -4,7 +4,7 @@
 clear 中的 backup 环节）的 Python 化替代，用来消除 Windows 上 subprocess exec `.sh` 抛
 `WinError 193` 的坑（`_run_script` 直接 exec shebang 文件在 Windows 无法启动）。
 
-设计契约（跟 shell 版严格等语义，见 docs/_review_inputs/2026-07-02-tarball-format-audit.md）：
+设计契约（跟 shell 版严格等语义）：
 
 - Tarball 结构严格 mirror `kb-export-package.sh` + `backup_create.sh` 产出：
     ``kb-export-{ts}.tar.gz`` 顶层含 ``{ts}/`` 目录，内含 ``config/`` + ``data/`` + ``meta/``

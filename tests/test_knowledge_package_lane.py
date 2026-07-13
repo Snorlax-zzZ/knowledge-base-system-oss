@@ -1,6 +1,6 @@
 """Legacy 知识包 lane 真实单测（不 mock service，直接跑）。
 
-对齐 docs/_review_inputs/2026-07-02-tarball-format-audit.md 的 §2.5 验收目标：
+验收目标：
 - 4 个 endpoint 真实调用路径（补上 test_api.py 里 monkeypatch 抓不到的部分）
 - 兼容性测：Python 版 export → Python 版 import 一致（round-trip）
 - 兼容性测：手工构造 shell 兼容 tarball → Python 版 import 成功（模拟 Mac shell
